@@ -1688,3 +1688,5 @@ log("Songs will be automatically restored when you return to levels")
 log("Continuous verification active - songs will stay loaded!")
 log("Favorites feature enabled!")
 log("Reset feature enabled!")
+
+loadPreferences()
