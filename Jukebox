@@ -1165,7 +1165,7 @@ local function makeGui()
 	resetDesc.Size = UDim2.new(1, -32, 0, 60)
 	resetDesc.Position = UDim2.new(0, 16, 0, 55)
 	resetDesc.BackgroundTransparency = 1
-	resetDesc.Text = "This will reset the current level's song back to the original and stop SoundLink. The reset state will be saved."
+	resetDesc.Text = "This will reset the current level's song back to the original."
 	resetDesc.TextColor3 = Color3.fromRGB(200, 200, 200)
 	resetDesc.TextSize = 13
 	resetDesc.TextWrapped = true
