@@ -926,7 +926,7 @@ local function makeGui()
 	frame.ZIndex = 100001
 	frame.BackgroundTransparency = 1
 
-	-- Logo
+	-- Logo (bigger and moved up)
 	local logoAsset = nil
 	if getAsset and safeIsFile(assetFiles[3]) then
 		local ok, asset = pcall(function() return getAsset(assetFiles[3]) end)
@@ -947,8 +947,8 @@ local function makeGui()
 
 	local titleImg = Instance.new("ImageLabel", frame)
 	titleImg.Name = "Title"
-	titleImg.Size = UDim2.new(0, 180, 0, 34)
-	titleImg.Position = UDim2.new(0.5, -90, 0, 0)
+	titleImg.Size = UDim2.new(0, 220, 0, 42)  -- Bigger logo
+	titleImg.Position = UDim2.new(0.5, -110, 0, -18)  -- Moved up even more
 	titleImg.BackgroundTransparency = 1
 	titleImg.Image = logoAsset
 	titleImg.ScaleType = Enum.ScaleType.Fit
@@ -960,13 +960,13 @@ local function makeGui()
 	close.Position = UDim2.new(1, -34, 0, 4)
 	close.Image = "rbxassetid://17188653361"
 	close.BackgroundTransparency = 1
-	close.ZIndex = 100002
+	close.ZIndex = 999999  -- Highest z-index to be above everything
 	
-	-- Tab container
+	-- Tab container (smaller and better fitted)
 	local tabContainer = Instance.new("Frame", frame)
 	tabContainer.Name = "TabContainer"
-	tabContainer.Size = UDim2.new(1, -16, 0, 28)
-	tabContainer.Position = UDim2.new(0, 8, 0, 36)
+	tabContainer.Size = UDim2.new(1, -24, 0, 24)  -- More padding to prevent overflow
+	tabContainer.Position = UDim2.new(0, 12, 0, 32)  -- More centered
 	tabContainer.BackgroundTransparency = 1
 	tabContainer.ZIndex = 100002
 	
@@ -976,8 +976,8 @@ local function makeGui()
 	local function createTabButton(tabName, index)
 		local tabBtn = Instance.new("ImageButton", tabContainer)
 		tabBtn.Name = tabName .. "Tab"
-		tabBtn.Size = UDim2.new(0.33, -4, 1, 0)
-		tabBtn.Position = UDim2.new((index-1) * 0.33, (index-1) * 2, 0, 0)
+		tabBtn.Size = UDim2.new(0.33, -6, 1, 0)  -- More spacing between tabs
+		tabBtn.Position = UDim2.new((index-1) * 0.33, (index-1) * 3, 0, 0)
 		tabBtn.Image = "rbxassetid://18807846310"
 		tabBtn.ScaleType = Enum.ScaleType.Slice
 		tabBtn.SliceCenter = Rect.new(100, 100, 100, 100)
@@ -989,7 +989,7 @@ local function makeGui()
 		tabText.BackgroundTransparency = 1
 		tabText.Text = tabName
 		tabText.TextColor3 = Color3.new(1, 1, 1)
-		tabText.TextSize = 12
+		tabText.TextSize = 11  -- Smaller text for smaller tabs
 		tabText.ZIndex = 100004
 		
 		return tabBtn, tabText
@@ -1000,18 +1000,18 @@ local function makeGui()
 		tabButtons[tabName] = {button = btn, text = txt}
 	end
 	
-	-- Search content
+	-- Search content (NO BLACK BACKGROUND)
 	local searchContent = Instance.new("Frame", frame)
 	searchContent.Name = "SearchContent"
-	searchContent.Size = UDim2.new(1, 0, 1, -70)
-	searchContent.Position = UDim2.new(0, 0, 0, 70)
-	searchContent.BackgroundTransparency = 1
+	searchContent.Size = UDim2.new(1, 0, 1, -62)  -- Adjusted for smaller tabs
+	searchContent.Position = UDim2.new(0, 0, 0, 62)  -- Adjusted for smaller tabs
+	searchContent.BackgroundTransparency = 1  -- FULLY TRANSPARENT
 	searchContent.ZIndex = 100001
 	searchContent.Visible = true
 	
 	local searchBox = Instance.new("TextBox", searchContent)
 	searchBox.Name = "SearchBox"
-	searchBox.Size = UDim2.new(1, -160, 0, 24)
+	searchBox.Size = UDim2.new(1, -90, 0, 24)  -- Adjusted width for closer search button
 	searchBox.Position = UDim2.new(0, 8, 0, 0)
 	searchBox.PlaceholderText = "Search query or paste ID"
 	searchBox.Text = ""
@@ -1024,20 +1024,11 @@ local function makeGui()
 	local searchBtn = Instance.new("ImageButton", searchContent)
 	searchBtn.Name = "SearchBtn"
 	searchBtn.Size = UDim2.new(0, 72, 0, 24)
-	searchBtn.Position = UDim2.new(1, -80, 0, 0)
-	searchBtn.Image = "rbxassetid://18807846310"
-	searchBtn.ScaleType = Enum.ScaleType.Slice
-	searchBtn.SliceCenter = Rect.new(100, 100, 100, 100)
+	searchBtn.Position = UDim2.new(1, -80, 0, 0)  -- Much closer to search box
+	searchBtn.Image = "rbxassetid://18473621676"
+	searchBtn.ScaleType = Enum.ScaleType.Fit
 	searchBtn.BackgroundTransparency = 1
 	searchBtn.ZIndex = 100003
-	
-	local searchBtnText = Instance.new("TextLabel", searchBtn)
-	searchBtnText.Size = UDim2.new(1, 0, 1, 0)
-	searchBtnText.BackgroundTransparency = 1
-	searchBtnText.Text = "Search"
-	searchBtnText.TextColor3 = Color3.new(1, 1, 1)
-	searchBtnText.TextSize = 13
-	searchBtnText.ZIndex = 100004
 	
 	local info = Instance.new("TextLabel", searchContent)
 	info.Name = "Info"
@@ -1119,12 +1110,12 @@ local function makeGui()
 	searchLayout.Padding = UDim.new(0, 6)
 	searchLayout.SortOrder = Enum.SortOrder.LayoutOrder
 	
-	-- Favorites content
+	-- Favorites content (NO BLACK BACKGROUND)
 	local favoritesContent = Instance.new("Frame", frame)
 	favoritesContent.Name = "FavoritesContent"
-	favoritesContent.Size = UDim2.new(1, 0, 1, -70)
-	favoritesContent.Position = UDim2.new(0, 0, 0, 70)
-	favoritesContent.BackgroundTransparency = 1
+	favoritesContent.Size = UDim2.new(1, 0, 1, -62)  -- Adjusted for smaller tabs
+	favoritesContent.Position = UDim2.new(0, 0, 0, 62)  -- Adjusted for smaller tabs
+	favoritesContent.BackgroundTransparency = 1  -- FULLY TRANSPARENT
 	favoritesContent.ZIndex = 100001
 	favoritesContent.Visible = false
 	
@@ -1142,12 +1133,12 @@ local function makeGui()
 	favoritesLayout.Padding = UDim.new(0, 6)
 	favoritesLayout.SortOrder = Enum.SortOrder.LayoutOrder
 	
-	-- Reset content
+	-- Reset content (NO BLACK BACKGROUND)
 	local resetContent = Instance.new("Frame", frame)
 	resetContent.Name = "ResetContent"
-	resetContent.Size = UDim2.new(1, 0, 1, -70)
-	resetContent.Position = UDim2.new(0, 0, 0, 70)
-	resetContent.BackgroundTransparency = 1
+	resetContent.Size = UDim2.new(1, 0, 1, -62)  -- Adjusted for smaller tabs
+	resetContent.Position = UDim2.new(0, 0, 0, 62)  -- Adjusted for smaller tabs
+	resetContent.BackgroundTransparency = 1  -- FULLY TRANSPARENT
 	resetContent.ZIndex = 100001
 	resetContent.Visible = false
 	
@@ -1175,8 +1166,8 @@ local function makeGui()
 	
 	local resetBtn = Instance.new("ImageButton", resetContent)
 	resetBtn.Name = "ResetBtn"
-	resetBtn.Size = UDim2.new(0, 150, 0, 35)
-	resetBtn.Position = UDim2.new(0.5, -75, 0, 130)
+	resetBtn.Size = UDim2.new(0, 140, 0, 32)  -- Slightly smaller
+	resetBtn.Position = UDim2.new(0.5, -70, 0, 130)
 	resetBtn.Image = "rbxassetid://18807846310"
 	resetBtn.ScaleType = Enum.ScaleType.Slice
 	resetBtn.SliceCenter = Rect.new(100, 100, 100, 100)
@@ -1690,3 +1681,10 @@ log("Favorites feature enabled!")
 log("Reset feature enabled!")
 
 loadPreferences()
+
+ccc = game:GetService("Players").LocalPlayer.PlayerGui.SFHGui.Frame.SearchContent.Scroll
+ccc.BackgroundTransparency = 1
+bbb = game:GetService("Players").LocalPlayer.PlayerGui.SFHGui.Frame.FavoritesContent.FavoritesScroll
+bbb.BackgroundTransparency = 1
+eee = game:GetService("Players").LocalPlayer.PlayerGui.SFHGui.Frame.SearchContent
+eee.Position = UDim2.new(0, 0, 0, 62)
