@@ -1,3 +1,22 @@
+local u = "https://raw.githubusercontent.com/NetlessScripter/Jukebox/refs/heads/main/achievement_01.ogg"
+local f = "Achievement01.ogg"
+
+if not isfile(f) then
+	writefile(f, game:HttpGet(u))
+end
+
+local g = getsynasset or getcustomasset
+local s = Instance.new("Sound")
+s.Name = "Achievement01"
+s.SoundId = g(f)
+s.Volume = 1
+s.Looped = false
+s.Parent = workspace
+
+function PlayAchievementSound()
+	s:Play()
+end
+
 local lp = game:GetService("Players").LocalPlayer
 local HttpService = game:GetService("HttpService")
 local UIS = game:GetService("UserInputService")
@@ -19,7 +38,11 @@ end
 
 -- Song preference storage
 local songPreferences = {}
+local favoriteSongs = {}
+local resetStates = {}
 local SAVE_FILE = "jukebox_preferences.json"
+local FAVORITES_FILE = "jukebox_favorites.json"
+local RESET_FILE = "jukebox_reset_states.json"
 
 local function loadPreferences()
 	if type(readfile) == "function" and type(isfile) == "function" then
@@ -33,12 +56,39 @@ local function loadPreferences()
 					local count = 0
 					for _ in pairs(songPreferences) do count = count + 1 end
 					log("Loaded preferences: " .. count .. " entries")
-					return
+				end
+			end
+		end
+		
+		-- Load favorites
+		local ok4, exists2 = pcall(isfile, FAVORITES_FILE)
+		if ok4 and exists2 then
+			local ok5, data2 = pcall(readfile, FAVORITES_FILE)
+			if ok5 and data2 then
+				local ok6, decoded2 = pcall(function() return HttpService:JSONDecode(data2) end)
+				if ok6 and type(decoded2) == "table" then
+					favoriteSongs = decoded2
+					local count = 0
+					for _ in pairs(favoriteSongs) do count = count + 1 end
+					log("Loaded favorites: " .. count .. " entries")
+				end
+			end
+		end
+		
+		-- Load reset states
+		local ok7, exists3 = pcall(isfile, RESET_FILE)
+		if ok7 and exists3 then
+			local ok8, data3 = pcall(readfile, RESET_FILE)
+			if ok8 and data3 then
+				local ok9, decoded3 = pcall(function() return HttpService:JSONDecode(data3) end)
+				if ok9 and type(decoded3) == "table" then
+					resetStates = decoded3
+					log("Loaded reset states")
 				end
 			end
 		end
 	end
-	log("No saved preferences found")
+	log("Loaded all data")
 end
 
 local function savePreferences()
@@ -47,6 +97,26 @@ local function savePreferences()
 		if ok and encoded then
 			pcall(writefile, SAVE_FILE, encoded)
 			log("Saved preferences")
+		end
+	end
+end
+
+local function saveFavorites()
+	if type(writefile) == "function" then
+		local ok, encoded = pcall(function() return HttpService:JSONEncode(favoriteSongs) end)
+		if ok and encoded then
+			pcall(writefile, FAVORITES_FILE, encoded)
+			log("Saved favorites")
+		end
+	end
+end
+
+local function saveResetStates()
+	if type(writefile) == "function" then
+		local ok, encoded = pcall(function() return HttpService:JSONEncode(resetStates) end)
+		if ok and encoded then
+			pcall(writefile, RESET_FILE, encoded)
+			log("Saved reset states")
 		end
 	end
 end
@@ -591,6 +661,34 @@ local function SoundLink(originalId, url)
 	watchContainer(SoundService)
 end
 
+local function clearSoundLink(originalId)
+	log("Clearing SoundLink for: " .. tostring(originalId))
+	
+	-- Clear all mirrors for this ID
+	if activeMirrors[originalId] then
+		for src, data in pairs(activeMirrors[originalId]) do
+			if data.mirror and data.mirror.Parent then
+				pcall(function() data.mirror:Destroy() end)
+			end
+			if data.tag and data.tag.Parent then
+				pcall(function() data.tag:Destroy() end)
+			end
+			-- Restore original volume
+			if src and src.Parent then
+				pcall(function() src.Volume = 1 end)
+			end
+		end
+		activeMirrors[originalId] = nil
+	end
+	
+	-- Clean up any remaining mirror sounds in workspace
+	for _, v in pairs(Workspace:GetChildren()) do
+		if v:IsA("Sound") and v.Name:find("sound_") then
+			v:Destroy()
+		end
+	end
+end
+
 -- Track currently playing song
 local currentSongLabel = nil
 local currentAuthorLabel = nil
@@ -650,6 +748,14 @@ local function updateIdDisplay(numericId, filename)
 	end
 end
 
+-- Restore original ID display
+local function restoreOriginalIdDisplay(numericId)
+	if currentSongIdLabel then
+		currentSongIdLabel.Text = "ID: " .. numericId
+		log("Restored original ID display: " .. currentSongIdLabel.Text)
+	end
+end
+
 -- Play song and update display
 local concurrentDownloads = 0
 local maxConcurrent = 2
@@ -704,6 +810,10 @@ local function playFromUrl(it, btn)
 		
 		-- Update ID display
 		updateIdDisplay(numericId, fname)
+		
+		-- Mark as not reset
+		resetStates[numericId] = false
+		saveResetStates()
 	end
 	
 	-- Update song display
@@ -749,6 +859,12 @@ local function checkAndRestoreSong()
 	
 	if not numericId then return end
 	
+	-- Check if this level has been reset
+	if resetStates[numericId] == true then
+		log("Level " .. numericId .. " is marked as reset, skipping restore")
+		return
+	end
+	
 	-- Check if this is a different level
 	if numericId ~= lastKnownOriginalId then
 		log("Level changed to ID: " .. numericId)
@@ -781,6 +897,8 @@ local function checkAndRestoreSong()
 end
 
 -- GUI
+local currentTab = "Search"
+
 local function makeGui()
 	if lp.PlayerGui:FindFirstChild("SFHGui") then 
 		log("Destroying old SFHGui")
@@ -844,10 +962,57 @@ local function makeGui()
 	close.BackgroundTransparency = 1
 	close.ZIndex = 100002
 	
-	local searchBox = Instance.new("TextBox", frame)
+	-- Tab container
+	local tabContainer = Instance.new("Frame", frame)
+	tabContainer.Name = "TabContainer"
+	tabContainer.Size = UDim2.new(1, -16, 0, 28)
+	tabContainer.Position = UDim2.new(0, 8, 0, 36)
+	tabContainer.BackgroundTransparency = 1
+	tabContainer.ZIndex = 100002
+	
+	local tabButtons = {}
+	local tabs = {"Search", "Favorites", "Reset"}
+	
+	local function createTabButton(tabName, index)
+		local tabBtn = Instance.new("ImageButton", tabContainer)
+		tabBtn.Name = tabName .. "Tab"
+		tabBtn.Size = UDim2.new(0.33, -4, 1, 0)
+		tabBtn.Position = UDim2.new((index-1) * 0.33, (index-1) * 2, 0, 0)
+		tabBtn.Image = "rbxassetid://18807846310"
+		tabBtn.ScaleType = Enum.ScaleType.Slice
+		tabBtn.SliceCenter = Rect.new(100, 100, 100, 100)
+		tabBtn.BackgroundTransparency = 1
+		tabBtn.ZIndex = 100003
+		
+		local tabText = Instance.new("TextLabel", tabBtn)
+		tabText.Size = UDim2.new(1, 0, 1, 0)
+		tabText.BackgroundTransparency = 1
+		tabText.Text = tabName
+		tabText.TextColor3 = Color3.new(1, 1, 1)
+		tabText.TextSize = 12
+		tabText.ZIndex = 100004
+		
+		return tabBtn, tabText
+	end
+	
+	for i, tabName in ipairs(tabs) do
+		local btn, txt = createTabButton(tabName, i)
+		tabButtons[tabName] = {button = btn, text = txt}
+	end
+	
+	-- Search content
+	local searchContent = Instance.new("Frame", frame)
+	searchContent.Name = "SearchContent"
+	searchContent.Size = UDim2.new(1, 0, 1, -70)
+	searchContent.Position = UDim2.new(0, 0, 0, 70)
+	searchContent.BackgroundTransparency = 1
+	searchContent.ZIndex = 100001
+	searchContent.Visible = true
+	
+	local searchBox = Instance.new("TextBox", searchContent)
 	searchBox.Name = "SearchBox"
 	searchBox.Size = UDim2.new(1, -160, 0, 24)
-	searchBox.Position = UDim2.new(0, 8, 0, 36)
+	searchBox.Position = UDim2.new(0, 8, 0, 0)
 	searchBox.PlaceholderText = "Search query or paste ID"
 	searchBox.Text = ""
 	searchBox.TextColor3 = Color3.new(1, 1, 1)
@@ -856,10 +1021,10 @@ local function makeGui()
 	searchBox.TextSize = 14
 	searchBox.ZIndex = 100002
 	
-	local searchBtn = Instance.new("ImageButton", frame)
+	local searchBtn = Instance.new("ImageButton", searchContent)
 	searchBtn.Name = "SearchBtn"
 	searchBtn.Size = UDim2.new(0, 72, 0, 24)
-	searchBtn.Position = UDim2.new(1, -80, 0, 36)
+	searchBtn.Position = UDim2.new(1, -80, 0, 0)
 	searchBtn.Image = "rbxassetid://18807846310"
 	searchBtn.ScaleType = Enum.ScaleType.Slice
 	searchBtn.SliceCenter = Rect.new(100, 100, 100, 100)
@@ -874,10 +1039,10 @@ local function makeGui()
 	searchBtnText.TextSize = 13
 	searchBtnText.ZIndex = 100004
 	
-	local info = Instance.new("TextLabel", frame)
+	local info = Instance.new("TextLabel", searchContent)
 	info.Name = "Info"
 	info.Size = UDim2.new(1, -16, 0, 24)
-	info.Position = UDim2.new(0, 8, 0, 66)
+	info.Position = UDim2.new(0, 8, 0, 30)
 	info.BackgroundTransparency = 1
 	info.TextColor3 = Color3.fromRGB(200, 200, 200)
 	info.TextSize = 12
@@ -900,10 +1065,10 @@ local function makeGui()
 		log("Using direct URL for loading circle")
 	end
 	
-	local loadingCircle = Instance.new("ImageLabel", frame)
+	local loadingCircle = Instance.new("ImageLabel", searchContent)
 	loadingCircle.Name = "LoadingCircle"
 	loadingCircle.Size = UDim2.new(0, 24, 0, 24)
-	loadingCircle.Position = UDim2.new(0, 8, 0, 66)
+	loadingCircle.Position = UDim2.new(0, 8, 0, 30)
 	loadingCircle.BackgroundTransparency = 1
 	loadingCircle.Image = loadingCircleAsset
 	loadingCircle.ImageColor3 = Color3.fromRGB(200, 200, 200)
@@ -940,19 +1105,193 @@ local function makeGui()
 		info.Visible = true
 	end
 	
-	local sc = Instance.new("ScrollingFrame", frame)
-	sc.Name = "Scroll"
-	sc.Position = UDim2.new(0, 8, 0, 94)
-	sc.Size = UDim2.new(1, -16, 1, -102)
-	sc.CanvasSize = UDim2.new(0, 0, 0, 0)
-	sc.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
-	sc.BorderSizePixel = 0
-	sc.ScrollBarThickness = 5
-	sc.ZIndex = 100001
+	local searchScroll = Instance.new("ScrollingFrame", searchContent)
+	searchScroll.Name = "Scroll"
+	searchScroll.Position = UDim2.new(0, 8, 0, 58)
+	searchScroll.Size = UDim2.new(1, -16, 1, -66)
+	searchScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+	searchScroll.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
+	searchScroll.BorderSizePixel = 0
+	searchScroll.ScrollBarThickness = 5
+	searchScroll.ZIndex = 100001
 	
-	local layout = Instance.new("UIListLayout", sc)
-	layout.Padding = UDim.new(0, 6)
-	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	local searchLayout = Instance.new("UIListLayout", searchScroll)
+	searchLayout.Padding = UDim.new(0, 6)
+	searchLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	
+	-- Favorites content
+	local favoritesContent = Instance.new("Frame", frame)
+	favoritesContent.Name = "FavoritesContent"
+	favoritesContent.Size = UDim2.new(1, 0, 1, -70)
+	favoritesContent.Position = UDim2.new(0, 0, 0, 70)
+	favoritesContent.BackgroundTransparency = 1
+	favoritesContent.ZIndex = 100001
+	favoritesContent.Visible = false
+	
+	local favoritesScroll = Instance.new("ScrollingFrame", favoritesContent)
+	favoritesScroll.Name = "FavoritesScroll"
+	favoritesScroll.Position = UDim2.new(0, 8, 0, 8)
+	favoritesScroll.Size = UDim2.new(1, -16, 1, -16)
+	favoritesScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+	favoritesScroll.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
+	favoritesScroll.BorderSizePixel = 0
+	favoritesScroll.ScrollBarThickness = 5
+	favoritesScroll.ZIndex = 100001
+	
+	local favoritesLayout = Instance.new("UIListLayout", favoritesScroll)
+	favoritesLayout.Padding = UDim.new(0, 6)
+	favoritesLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	
+	-- Reset content
+	local resetContent = Instance.new("Frame", frame)
+	resetContent.Name = "ResetContent"
+	resetContent.Size = UDim2.new(1, 0, 1, -70)
+	resetContent.Position = UDim2.new(0, 0, 0, 70)
+	resetContent.BackgroundTransparency = 1
+	resetContent.ZIndex = 100001
+	resetContent.Visible = false
+	
+	local resetTitle = Instance.new("TextLabel", resetContent)
+	resetTitle.Size = UDim2.new(1, -16, 0, 30)
+	resetTitle.Position = UDim2.new(0, 8, 0, 20)
+	resetTitle.BackgroundTransparency = 1
+	resetTitle.Text = "Reset Current Song"
+	resetTitle.TextColor3 = Color3.new(1, 1, 1)
+	resetTitle.TextSize = 18
+	resetTitle.Font = Enum.Font.SourceSansBold
+	resetTitle.ZIndex = 100002
+	
+	local resetDesc = Instance.new("TextLabel", resetContent)
+	resetDesc.Size = UDim2.new(1, -32, 0, 60)
+	resetDesc.Position = UDim2.new(0, 16, 0, 55)
+	resetDesc.BackgroundTransparency = 1
+	resetDesc.Text = "This will reset the current level's song back to the original and stop SoundLink. The reset state will be saved."
+	resetDesc.TextColor3 = Color3.fromRGB(200, 200, 200)
+	resetDesc.TextSize = 13
+	resetDesc.TextWrapped = true
+	resetDesc.TextXAlignment = Enum.TextXAlignment.Left
+	resetDesc.TextYAlignment = Enum.TextYAlignment.Top
+	resetDesc.ZIndex = 100002
+	
+	local resetBtn = Instance.new("ImageButton", resetContent)
+	resetBtn.Name = "ResetBtn"
+	resetBtn.Size = UDim2.new(0, 150, 0, 35)
+	resetBtn.Position = UDim2.new(0.5, -75, 0, 130)
+	resetBtn.Image = "rbxassetid://18807846310"
+	resetBtn.ScaleType = Enum.ScaleType.Slice
+	resetBtn.SliceCenter = Rect.new(100, 100, 100, 100)
+	resetBtn.BackgroundTransparency = 1
+	resetBtn.ZIndex = 100003
+	
+	local resetBtnText = Instance.new("TextLabel", resetBtn)
+	resetBtnText.Size = UDim2.new(1, 0, 1, 0)
+	resetBtnText.BackgroundTransparency = 1
+	resetBtnText.Text = "Reset Song"
+	resetBtnText.TextColor3 = Color3.new(1, 1, 1)
+	resetBtnText.TextSize = 14
+	resetBtnText.Font = Enum.Font.SourceSansBold
+	resetBtnText.ZIndex = 100004
+	
+	local resetStatus = Instance.new("TextLabel", resetContent)
+	resetStatus.Size = UDim2.new(1, -32, 0, 30)
+	resetStatus.Position = UDim2.new(0, 16, 0, 175)
+	resetStatus.BackgroundTransparency = 1
+	resetStatus.Text = ""
+	resetStatus.TextColor3 = Color3.fromRGB(100, 255, 100)
+	resetStatus.TextSize = 13
+	resetStatus.ZIndex = 100002
+	
+	-- Reset button functionality
+	resetBtn.MouseButton1Down:Connect(function()
+
+PlayAchievementSound()
+
+game.StarterGui:SetCore("SendNotification", {
+    Title = "NOTIFICATION";
+    Text = "Rejoin for these changes to apply.";
+    Duration = 5;
+})
+
+		local fullId, numericId = getOriginalSongId()
+		if not numericId then
+			resetStatus.Text = "Error: Could not get current song ID"
+			resetStatus.TextColor3 = Color3.fromRGB(255, 100, 100)
+			return
+		end
+		
+		-- Clear the SoundLink
+		if fullId then
+			clearSoundLink(fullId)
+		end
+		
+		-- Stop mirror sound
+		if activeMirrorSound and activeMirrorSound.Parent then
+			activeMirrorSound:Stop()
+			activeMirrorSound:Destroy()
+			activeMirrorSound = nil
+		end
+		
+		-- Remove from preferences
+		if songPreferences[numericId] then
+			songPreferences[numericId] = nil
+			savePreferences()
+		end
+		
+		-- Mark as reset
+		resetStates[numericId] = true
+		saveResetStates()
+		
+		-- Restore original ID display
+		restoreOriginalIdDisplay(numericId)
+		
+		resetStatus.Text = "Original audio restored."
+		resetStatus.TextColor3 = Color3.fromRGB(100, 255, 100)
+		
+		log("Reset song for ID: " .. numericId)
+		
+		-- Clear status after 3 seconds
+		task.delay(3, function()
+			resetStatus.Text = ""
+		end)
+	end)
+	
+	-- Tab switching function
+	local function switchTab(tabName)
+		currentTab = tabName
+		
+		-- Update tab button appearances
+		for name, data in pairs(tabButtons) do
+			if name == tabName then
+				data.button.ImageColor3 = Color3.fromRGB(255, 255, 255)
+				data.text.TextColor3 = Color3.new(1, 1, 1)
+			else
+				data.button.ImageColor3 = Color3.fromRGB(150, 150, 150)
+				data.text.TextColor3 = Color3.fromRGB(180, 180, 180)
+			end
+		end
+		
+		-- Show/hide content
+		searchContent.Visible = (tabName == "Search")
+		favoritesContent.Visible = (tabName == "Favorites")
+		resetContent.Visible = (tabName == "Reset")
+		
+		-- Load favorites if switching to that tab
+		if tabName == "Favorites" then
+			loadFavoritesTab()
+		end
+		
+		log("Switched to tab: " .. tabName)
+	end
+	
+	-- Connect tab buttons
+	for name, data in pairs(tabButtons) do
+		data.button.MouseButton1Down:Connect(function()
+			switchTab(name)
+		end)
+	end
+	
+	-- Set initial tab
+	switchTab("Search")
 	
 	-- Close button stops sound and closes UI
 	close.MouseButton1Down:Connect(function() 
@@ -995,13 +1334,19 @@ local function makeGui()
 		end
 	end)
 	
-	return gui, frame, sc, searchBox, searchBtn, info, layout, loadingCircle, startLoadingAnimation, stopLoadingAnimation
+	return gui, frame, searchScroll, searchBox, searchBtn, info, searchLayout, loadingCircle, startLoadingAnimation, stopLoadingAnimation, favoritesScroll, favoritesLayout
 end
 
-local gui, frame, sc, searchBox, searchBtn, info, layout, loadingCircle, startLoadingAnimation, stopLoadingAnimation = makeGui()
+local gui, frame, sc, searchBox, searchBtn, info, layout, loadingCircle, startLoadingAnimation, stopLoadingAnimation, favoritesScroll, favoritesLayout = makeGui()
 
 local function clearScroll()
 	for _, v in pairs(sc:GetChildren()) do 
+		if v:IsA("Frame") or v:IsA("ImageLabel") then v:Destroy() end 
+	end
+end
+
+local function clearFavorites()
+	for _, v in pairs(favoritesScroll:GetChildren()) do 
 		if v:IsA("Frame") or v:IsA("ImageLabel") then v:Destroy() end 
 	end
 end
@@ -1016,6 +1361,41 @@ local function getLevelText()
 		if snn and snn:IsA("TextLabel") then return snn.Text end
 	end
 	return ""
+end
+
+-- Create unique key for favorites
+local function createFavoriteKey(it)
+	return it.id .. "_" .. it.title .. "_" .. it.artist
+end
+
+-- Check if song is favorited
+local function isFavorited(it)
+	local key = createFavoriteKey(it)
+	return favoriteSongs[key] ~= nil
+end
+
+-- Toggle favorite
+local function toggleFavorite(it, favoriteBtn)
+	local key = createFavoriteKey(it)
+	
+	if isFavorited(it) then
+		-- Remove from favorites
+		favoriteSongs[key] = nil
+		favoriteBtn.Image = "rbxassetid://18477104435"
+		log("Removed from favorites: " .. it.title)
+	else
+		-- Add to favorites
+		favoriteSongs[key] = {
+			title = it.title,
+			artist = it.artist,
+			id = it.id,
+			raw = it.raw
+		}
+		favoriteBtn.Image = "rbxassetid://18477090107"
+		log("Added to favorites: " .. it.title)
+	end
+	
+	saveFavorites()
 end
 
 local searchDeb = false
@@ -1060,8 +1440,8 @@ searchBox.FocusLost:Connect(function(enter) if enter then performSearch() end en
 -- Results display
 local pageSize = 18
 
-local function addResultEntry(it)
-	local entryFrame = Instance.new("ImageLabel", sc)
+local function addResultEntry(it, parentScroll, parentLayout)
+	local entryFrame = Instance.new("ImageLabel", parentScroll)
 	entryFrame.Size = UDim2.new(1, -10, 0, 56)
 	entryFrame.Image = "rbxassetid://18807846310"
 	entryFrame.ScaleType = Enum.ScaleType.Slice
@@ -1092,9 +1472,25 @@ local function addResultEntry(it)
 	sub.TextTruncate = Enum.TextTruncate.AtEnd
 	sub.ZIndex = 100011
 	
+	-- Favorite button
+	local favoriteBtn = Instance.new("ImageButton", entryFrame)
+	favoriteBtn.Name = "FavoriteBtn"
+	favoriteBtn.Size = UDim2.new(0.45, 0, 0.45, 0)
+	favoriteBtn.Position = UDim2.new(0.62, 0, 0.25, 0)
+	favoriteBtn.AnchorPoint = Vector2.new(0.5, 0.5)
+	favoriteBtn.Image = isFavorited(it) and "rbxassetid://18477090107" or "rbxassetid://18477104435"
+	favoriteBtn.BackgroundTransparency = 1
+	favoriteBtn.ZIndex = 100012
+	favoriteBtn.ScaleType = Enum.ScaleType.Fit
+	
+	favoriteBtn.MouseButton1Down:Connect(function()
+		toggleFavorite(it, favoriteBtn)
+	end)
+	
+	-- Play button
 	local btn = Instance.new("ImageButton", entryFrame)
-	btn.Size = UDim2.new(0.449999988, 0, 0.449999988, 0)
-	btn.Position = UDim2.new(0.75, 0, 0.25, 0)
+	btn.Size = UDim2.new(0.45, 0, 0.45, 0)
+	btn.Position = UDim2.new(0.85, 0, 0.25, 0)
 	btn.AnchorPoint = Vector2.new(0.5, 0.5)
 	btn.Image = "rbxassetid://18177735935"
 	btn.BackgroundTransparency = 1
@@ -1129,13 +1525,13 @@ local function addResultEntry(it)
 		deb = false
 	end)
 	
-	sc.CanvasSize = UDim2.new(0, 0, 0, layout.AbsoluteContentSize.Y + 6)
+	parentScroll.CanvasSize = UDim2.new(0, 0, 0, parentLayout.AbsoluteContentSize.Y + 6)
 end
 
 function showResults(res, start)
 	start = start or 1
 	local last = math.min(#res, (start-1)+pageSize)
-	for i = start, last do addResultEntry(res[i]) end
+	for i = start, last do addResultEntry(res[i], sc, layout) end
 	if last < #res then
 		local moreFrame = Instance.new("ImageLabel", sc)
 		moreFrame.Size = UDim2.new(1, -10, 0, 32)
@@ -1158,6 +1554,32 @@ function showResults(res, start)
 	sc.CanvasSize = UDim2.new(0, 0, 0, layout.AbsoluteContentSize.Y + 6)
 end
 
+-- Load favorites tab
+function loadFavoritesTab()
+	clearFavorites()
+	
+	local count = 0
+	for key, songData in pairs(favoriteSongs) do
+		count = count + 1
+		addResultEntry(songData, favoritesScroll, favoritesLayout)
+	end
+	
+	if count == 0 then
+		local emptyLabel = Instance.new("TextLabel", favoritesScroll)
+		emptyLabel.Size = UDim2.new(1, -16, 0, 40)
+		emptyLabel.Position = UDim2.new(0, 8, 0, 20)
+		emptyLabel.BackgroundTransparency = 1
+		emptyLabel.Text = "No favorite songs yet!\nClick the heart icon to add songs to favorites."
+		emptyLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
+		emptyLabel.TextSize = 13
+		emptyLabel.TextWrapped = true
+		emptyLabel.ZIndex = 100011
+	end
+	
+	favoritesScroll.CanvasSize = UDim2.new(0, 0, 0, favoritesLayout.AbsoluteContentSize.Y + 6)
+	log("Loaded " .. count .. " favorites")
+end
+
 local function openPanel(q)
 	if not gui or not gui.Parent then return end
 	gui.Enabled = true
@@ -1166,7 +1588,7 @@ local function openPanel(q)
 	info.Text = ""
 	
 	-- Bounce animation
-	local targetSize = UDim2.new(0, 400, 0, 280)  -- Good readable size
+	local targetSize = UDim2.new(0, 420, 0, 320)  -- Slightly bigger for tabs
 	local tweenInfo = TweenInfo.new(
 		0.5,  -- Duration
 		Enum.EasingStyle.Back,  -- Easing style (Back creates bounce)
@@ -1217,7 +1639,7 @@ task.spawn(function()
 		if not lp or not lp.Parent then break end
 		
 		local fullId, numericId = getOriginalSongId()
-		if numericId and songPreferences[numericId] then
+		if numericId and songPreferences[numericId] and resetStates[numericId] ~= true then
 			local pref = songPreferences[numericId]
 			
 			-- Check if the displayed song info matches our saved preference
@@ -1264,3 +1686,5 @@ log("=== JUKEBOX READY ===")
 log("Click the pin disc to open the song search panel")
 log("Songs will be automatically restored when you return to levels")
 log("Continuous verification active - songs will stay loaded!")
+log("Favorites feature enabled!")
+log("Reset feature enabled!")
