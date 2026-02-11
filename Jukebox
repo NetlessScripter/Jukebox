@@ -1416,9 +1416,9 @@ local function performSearch()
 	end
 	
 	if not results or #results == 0 then
-		info.Text = "No results" .. (meta and (" [" .. meta .. "]") or "")
+		info.Text = "No results"
 	else
-		info.Text = #results .. " result" .. (#results==1 and "" or "s") .. (meta and (" [" .. meta .. "]") or "")
+		info.Text = ""
 		showResults(results, 1)
 	end
 	
@@ -1609,6 +1609,72 @@ UIS.InputBegan:Connect(function(i, gp)
 	end
 end)
 
+-- AUTO-LOAD PREFERENCES ON STARTUP
+-- Immediately set up SoundLinks for ALL saved preferences without waiting for UI
+task.spawn(function()
+	log("=== AUTO-LOAD: Starting immediate preference application ===")
+	task.wait(0.5)  -- Brief wait for basic initialization
+	
+	local count = 0
+	for levelId, pref in pairs(songPreferences) do
+		if pref and pref.url and resetStates[levelId] ~= true then
+			local rbxAssetId = "rbxassetid://" .. levelId
+			log("=== AUTO-LOAD: Setting up SoundLink for level " .. levelId .. " ===")
+			log("    Song: " .. pref.title .. " by " .. pref.artist)
+			
+			-- Set up SoundLink immediately
+			SoundLink(rbxAssetId, pref.url)
+			count = count + 1
+			
+			task.wait(0.1)  -- Small delay between setups to prevent overwhelming
+		end
+	end
+	
+	if count > 0 then
+		log("=== AUTO-LOAD: Successfully set up " .. count .. " SoundLinks! ===")
+	else
+		log("=== AUTO-LOAD: No saved preferences to load ===")
+	end
+end)
+
+-- Monitor for UI updates to show correct song info in the display
+task.spawn(function()
+	while true do
+		task.wait(1)
+		if not lp or not lp.Parent then break end
+		
+		local fullId, numericId = getOriginalSongId()
+		if numericId then
+			local pref = songPreferences[numericId]
+			if pref and resetStates[numericId] ~= true then
+				-- Update the display if we have a preference
+				local songInfo = lp.PlayerGui:FindFirstChild("MainUI")
+					and lp.PlayerGui.MainUI:FindFirstChild("States")
+					and lp.PlayerGui.MainUI.States:FindFirstChild("OnlineLevelViewMenu")
+					and lp.PlayerGui.MainUI.States.OnlineLevelViewMenu:FindFirstChild("MiddleItems")
+					and lp.PlayerGui.MainUI.States.OnlineLevelViewMenu.MiddleItems:FindFirstChild("SongInfo")
+				
+				if songInfo then
+					local songNameLabel = songInfo:FindFirstChild("SongName")
+					local usernameLabel = songInfo:FindFirstChild("Username")
+					
+					if songNameLabel and usernameLabel then
+						if songNameLabel.Text ~= pref.title or usernameLabel.Text ~= pref.artist then
+							updateSongDisplay(pref.title, pref.artist)
+							
+							if pref.filename then
+								updateIdDisplay(numericId, pref.filename)
+							end
+							
+							log("Updated display for level " .. numericId)
+						end
+					end
+				end
+			end
+		end
+	end
+end)
+
 -- Monitor for level changes and auto-restore songs
 task.spawn(function()
 	while true do
@@ -1676,6 +1742,7 @@ end)
 log("=== JUKEBOX READY ===")
 log("Click the pin disc to open the song search panel")
 log("Songs will be automatically restored when you return to levels")
+log("AUTO-LOAD: Saved preferences will be loaded automatically in 0.5 seconds!")
 log("Continuous verification active - songs will stay loaded!")
 log("Favorites feature enabled!")
 log("Reset feature enabled!")
