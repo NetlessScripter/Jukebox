@@ -1,0 +1,244 @@
+local P = game:GetService("Players")
+local RS = game:GetService("RunService")
+local lp = P.LocalPlayer
+local root = lp and lp.PlayerGui and lp.PlayerGui.SFHGui
+
+local function gv(line, key)
+	local s,e = string.find(line, key..'=')
+	if not e then return end
+	local sp = e + 1
+	local sub = string.sub(line, sp, #line)
+	local spc = string.find(sub, ' ')
+	local en
+	if spc then en = sp + spc - 1 else en = #line end
+	local val = string.sub(line, sp, en)
+	if string.sub(val,1,1) ~= '"' and string.sub(val,#val,#val) ~= '"' then
+		local n = tonumber(val)
+		return n
+	end
+	val = string.sub(val,2,#val-1)
+	if val == "space" then return ' ' end
+	return val
+end
+
+local function ParseFNT(txt, sheet)
+	local t = {}
+	t.spritesheet = sheet
+	t.chars = {}
+	local lines = string.split(txt, "\n")
+	assert(#lines > 4, "invalid fnt")
+	t.lineHeight = gv(lines[2], "common lineHeight") or gv(lines[2], "lineHeight") or 64
+	local count = gv(lines[4], "chars count") or 0
+	local startIdx = 5
+	for i = 1, count do
+		local ln = lines[startIdx + i - 1]
+		if ln then
+			local letter = gv(ln, "letter")
+			local id = gv(ln, "id")
+			local x = gv(ln, "x") or 0
+			local y = gv(ln, "y") or 0
+			local w = gv(ln, "width") or 0
+			local h = gv(ln, "height") or 0
+			local xo = gv(ln, "xoffset") or 0
+			local yo = gv(ln, "yoffset") or 0
+			local xa = gv(ln, "xadvance") or w
+			if letter then
+				t.chars[tostring(letter)] = {
+					id = id,
+					x = x,
+					y = y,
+					width = w,
+					height = h,
+					xoffset = xo,
+					yoffset = yo,
+					xadvance = xa
+				}
+			end
+		end
+	end
+	return t
+end
+
+local function CleanOld(lbl)
+	if not lbl or not lbl.Parent then return end
+	local old = lbl:FindFirstChild("GDFont")
+	if old then old:Destroy() end
+	local attr = lbl:GetAttribute("__GDFontConns")
+	if type(attr) == "table" then
+		for i = 1, #attr do
+			local c = attr[i]
+			if c and type(c.Disconnect) == "function" then
+				pcall(function() c:Disconnect() end)
+			elseif c and type(c.disconnect) == "function" then
+				pcall(function() c:disconnect() end)
+			end
+		end
+	end
+	lbl:SetAttribute("__GDFontConns", nil)
+end
+
+local function BuildGlyph(ch, fnt, color)
+	local c = fnt.chars[ch]
+	if not c then return nil end
+	local f = Instance.new("Frame")
+	f.BackgroundTransparency = 1
+	f.BorderSizePixel = 0
+	f.Size = UDim2.fromScale(c.xadvance / fnt.lineHeight, 1)
+	f.SizeConstraint = Enum.SizeConstraint.RelativeYY
+	f.Name = ch
+	local img = Instance.new("ImageLabel", f)
+	img.Name = "GlyphImg"
+	img.BackgroundTransparency = 1
+	img.BorderSizePixel = 0
+	img.AnchorPoint = Vector2.new(0,0)
+	img.Position = UDim2.fromScale(c.xoffset / c.xadvance, c.yoffset / fnt.lineHeight)
+	img.Size = UDim2.fromScale(c.width / c.xadvance, c.height / fnt.lineHeight)
+	img.Image = fnt.spritesheet
+	img.ImageRectOffset = Vector2.new(c.x, c.y)
+	img.ImageRectSize = Vector2.new(c.width, c.height)
+	if color then img.ImageColor3 = color end
+	return f
+end
+
+local function UpdateOnce(lbl, fnt)
+	if not lbl or not lbl.Parent then return end
+	CleanOld(lbl)
+	local txt = lbl.Text or ""
+	if lbl:IsA("TextBox") and #txt == 0 then txt = lbl.PlaceholderText or "" end
+	local cont = Instance.new("Frame", lbl)
+	cont.Name = "GDFont"
+	cont.BackgroundTransparency = 1
+	cont.BorderSizePixel = 0
+	cont.AnchorPoint = Vector2.new(0.5,0.5)
+	cont.Position = UDim2.fromScale(0.5,0.5)
+	cont.Size = UDim2.fromScale(1,1)
+	cont.Visible = false
+	local list = Instance.new("UIListLayout", cont)
+	list.FillDirection = Enum.FillDirection.Horizontal
+	list.HorizontalAlignment = Enum.HorizontalAlignment.Center
+	list.VerticalAlignment = Enum.VerticalAlignment.Center
+	list.SortOrder = Enum.SortOrder.LayoutOrder
+	list.Padding = UDim.new(0,0)
+	local words = {}
+	local cur = ""
+	for i = 1, #txt do
+		local c = string.sub(txt,i,i)
+		if c == " " then
+			table.insert(words, cur)
+			cur = ""
+		else
+			cur = cur .. c
+		end
+	end
+	table.insert(words, cur)
+	local lo = 1
+	for wi = 1, #words do
+		local w = words[wi]
+		if w == "" then
+			local sp = Instance.new("Frame", cont)
+			sp.BackgroundTransparency = 1
+			sp.BorderSizePixel = 0
+			local adv = (fnt.chars[" "] and fnt.chars[" "].xadvance) or math.floor(fnt.lineHeight/2)
+			sp.Size = UDim2.fromScale(adv / fnt.lineHeight, 1)
+			sp.SizeConstraint = Enum.SizeConstraint.RelativeYY
+			sp.LayoutOrder = lo
+			lo = lo + 1
+		else
+			for ci = 1, #w do
+				local ch = string.upper(string.sub(w, ci, ci))
+				local g = BuildGlyph(ch, fnt, lbl.TextColor3)
+				if g then
+					g.LayoutOrder = lo
+					g.Parent = cont
+					lo = lo + 1
+				end
+			end
+			if wi < #words then
+				local sp = Instance.new("Frame", cont)
+				sp.BackgroundTransparency = 1
+				sp.BorderSizePixel = 0
+				local adv = (fnt.chars[" "] and fnt.chars[" "].xadvance) or math.floor(fnt.lineHeight/2)
+				sp.Size = UDim2.fromScale(adv / fnt.lineHeight, 1)
+				sp.SizeConstraint = Enum.SizeConstraint.RelativeYY
+				sp.LayoutOrder = lo
+				lo = lo + 1
+			end
+		end
+	end
+	local us = Instance.new("UIScale", cont)
+	us.Scale = 1
+	cont.Visible = true
+	RS.RenderStepped:Wait()
+	local totalW = list.AbsoluteContentSize.X
+	local avail = lbl.AbsoluteSize.X
+	if totalW > 0 and avail > 0 then
+		local scale = math.min(1, avail / totalW)
+		us.Scale = scale
+	end
+end
+
+local function WatchLabel(lbl, fnt)
+	if not lbl or not lbl.Parent then return end
+	CleanOld(lbl)
+	UpdateOnce(lbl, fnt)
+	local cons = {}
+	table.insert(cons, lbl:GetPropertyChangedSignal("Text"):Connect(function() UpdateOnce(lbl, fnt) end))
+	table.insert(cons, lbl:GetPropertyChangedSignal("TextColor3"):Connect(function() UpdateOnce(lbl, fnt) end))
+	table.insert(cons, lbl:GetPropertyChangedSignal("AbsoluteSize"):Connect(function() UpdateOnce(lbl, fnt) end))
+	lbl:SetAttribute("__GDFontConns", cons)
+end
+
+local function ApplyToGui(fnt, gui)
+	if not gui then return end
+	for i = 1, #gui:GetDescendants() do
+		local v = gui:GetDescendants()[i]
+		if v and (v:IsA("TextLabel") or v:IsA("TextBox")) then
+			pcall(function() WatchLabel(v, fnt) end)
+		end
+	end
+	gui.DescendantAdded:Connect(function(d)
+		if d and (d:IsA("TextLabel") or d:IsA("TextBox")) then
+			pcall(function() WatchLabel(d, fnt) end)
+		end
+	end)
+end
+
+local sampleFNT = [[
+info face="Custom" size=32
+common lineHeight=64 scaleW=1024 scaleH=1024
+page id=0 file="sheet.png"
+chars count=26
+char id=65 letter="A" x=0 y=0 width=40 height=60 xoffset=0 yoffset=2 xadvance=42
+char id=66 letter="B" x=40 y=0 width=38 height=60 xoffset=0 yoffset=2 xadvance=40
+char id=67 letter="C" x=78 y=0 width=36 height=60 xoffset=0 yoffset=2 xadvance=38
+char id=68 letter="D" x=114 y=0 width=40 height=60 xoffset=0 yoffset=2 xadvance=42
+char id=69 letter="E" x=154 y=0 width=34 height=60 xoffset=0 yoffset=2 xadvance=36
+char id=70 letter="F" x=188 y=0 width=34 height=60 xoffset=0 yoffset=2 xadvance=36
+char id=71 letter="G" x=222 y=0 width=42 height=60 xoffset=0 yoffset=2 xadvance=44
+char id=72 letter="H" x=264 y=0 width=40 height=60 xoffset=0 yoffset=2 xadvance=42
+char id=73 letter="I" x=304 y=0 width=18 height=60 xoffset=0 yoffset=2 xadvance=20
+char id=74 letter="J" x=322 y=0 width=30 height=60 xoffset=0 yoffset=2 xadvance=32
+char id=75 letter="K" x=352 y=0 width=38 height=60 xoffset=0 yoffset=2 xadvance=40
+char id=76 letter="L" x=390 y=0 width=32 height=60 xoffset=0 yoffset=2 xadvance=34
+char id=77 letter="M" x=422 y=0 width=56 height=60 xoffset=0 yoffset=2 xadvance=58
+char id=78 letter="N" x=478 y=0 width=46 height=60 xoffset=0 yoffset=2 xadvance=48
+char id=79 letter="O" x=524 y=0 width=44 height=60 xoffset=0 yoffset=2 xadvance=46
+char id=80 letter="P" x=568 y=0 width=38 height=60 xoffset=0 yoffset=2 xadvance=40
+char id=81 letter="Q" x=606 y=0 width=44 height=60 xoffset=0 yoffset=2 xadvance=46
+char id=82 letter="R" x=650 y=0 width=40 height=60 xoffset=0 yoffset=2 xadvance=42
+char id=83 letter="S" x=690 y=0 width=36 height=60 xoffset=0 yoffset=2 xadvance=38
+char id=84 letter="T" x=726 y=0 width=36 height=60 xoffset=0 yoffset=2 xadvance=38
+char id=85 letter="U" x=762 y=0 width=44 height=60 xoffset=0 yoffset=2 xadvance=46
+char id=86 letter="V" x=806 y=0 width=44 height=60 xoffset=0 yoffset=2 xadvance=46
+char id=87 letter="W" x=850 y=0 width=64 height=60 xoffset=0 yoffset=2 xadvance=66
+char id=88 letter="X" x=914 y=0 width=44 height=60 xoffset=0 yoffset=2 xadvance=46
+char id=89 letter="Y" x=958 y=0 width=44 height=60 xoffset=0 yoffset=2 xadvance=46
+char id=90 letter="Z" x=1002 y=0 width=40 height=60 xoffset=0 yoffset=2 xadvance=42
+]]
+
+local spritesheet = "rbxassetid://94822893010434"
+local fnt = ParseFNT(sampleFNT, spritesheet)
+
+if root then
+	ApplyToGui(fnt, root)
+end
