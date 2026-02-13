@@ -1,0 +1,2580 @@
+-- ============================================================================
+-- BITMAP FONT RENDERER (INTEGRATED)
+-- ============================================================================
+
+local RunService = game:GetService("RunService")
+
+local BitmapFontRenderer = {}
+BitmapFontRenderer.__index = BitmapFontRenderer
+
+-- Configuration
+local CONFIG = {
+	DEFAULT_POOL_SIZE = 50,
+	MAX_CACHE_SIZE = 100,
+	CLEANUP_INTERVAL = 5,
+	DEFAULT_LINE_HEIGHT = 32,
+}
+
+-- Helper Functions
+local function ParseValue(text: string, key: string): any?
+	local pattern = key .. "=([^%s]+)"
+	local value = string.match(text, pattern)
+	
+	if not value then return nil end
+	
+	-- Remove quotes if present
+	if string.sub(value, 1, 1) == '"' then
+		value = string.sub(value, 2, -2)
+		return value == "space" and " " or value
+	end
+	
+	return tonumber(value) or value
+end
+
+local function ParseImageTag(tagText: string): (string?, string?, table?)
+	-- Format: <TYPE:ID:WIDTH:HEIGHT>
+	local parts = string.split(string.sub(tagText, 2, -2), ":")
+	
+	if #parts < 4 then return nil end
+	
+	local tagType = parts[1]
+	local id = tonumber(parts[2]) or parts[2]
+	local width = tonumber(parts[3]) or 1
+	local height = tonumber(parts[4]) or 1
+	
+	return tagType, id, {width, height}
+end
+
+local function FindImageTags(text: string): {table}
+	local tags = {}
+	local pattern = "<%w+:%w+:[^:>]+:[^>]+>"
+	local startPos = 1
+	
+	while true do
+		local tagStart, tagEnd = string.find(text, pattern, startPos)
+		if not tagStart then break end
+		
+		table.insert(tags, {tagStart, tagEnd})
+		startPos = tagEnd + 1
+	end
+	
+	return tags
+end
+
+-- Object Pool Implementation
+local ObjectPool = {}
+ObjectPool.__index = ObjectPool
+
+function ObjectPool.new(createFunc: () -> any, resetFunc: (any) -> ()): table
+	local self = setmetatable({}, ObjectPool)
+	self.createFunc = createFunc
+	self.resetFunc = resetFunc
+	self.available = {}
+	self.inUse = {}
+	return self
+end
+
+function ObjectPool:Get(): any
+	local obj = table.remove(self.available)
+	
+	if not obj then
+		obj = self.createFunc()
+	end
+	
+	self.inUse[obj] = true
+	return obj
+end
+
+function ObjectPool:Release(obj: any)
+	if not self.inUse[obj] then return end
+	
+	self.inUse[obj] = nil
+	self.resetFunc(obj)
+	table.insert(self.available, obj)
+end
+
+function ObjectPool:ReleaseAll()
+	for obj in pairs(self.inUse) do
+		self.resetFunc(obj)
+		table.insert(self.available, obj)
+	end
+	table.clear(self.inUse)
+end
+
+function ObjectPool:Clear()
+	for _, obj in ipairs(self.available) do
+		if typeof(obj) == "Instance" then
+			obj:Destroy()
+		end
+	end
+	
+	for obj in pairs(self.inUse) do
+		if typeof(obj) == "Instance" then
+			obj:Destroy()
+		end
+	end
+	
+	table.clear(self.available)
+	table.clear(self.inUse)
+end
+
+-- Cache Implementation
+local Cache = {}
+Cache.__index = Cache
+
+function Cache.new(maxSize: number): table
+	local self = setmetatable({}, Cache)
+	self.data = {}
+	self.order = {}
+	self.maxSize = maxSize or CONFIG.MAX_CACHE_SIZE
+	return self
+end
+
+function Cache:Get(key: string): any?
+	return self.data[key]
+end
+
+function Cache:Set(key: string, value: any)
+	if self.data[key] then
+		-- Update existing
+		self.data[key] = value
+		return
+	end
+	
+	-- Add new
+	if #self.order >= self.maxSize then
+		-- Remove oldest
+		local oldKey = table.remove(self.order, 1)
+		self.data[oldKey] = nil
+	end
+	
+	self.data[key] = value
+	table.insert(self.order, key)
+end
+
+function Cache:Clear()
+	table.clear(self.data)
+	table.clear(self.order)
+end
+
+-- Main Font Renderer
+function BitmapFontRenderer.new(): table
+	local self = setmetatable({}, BitmapFontRenderer)
+	
+	self.loadedFonts = {}
+	self.textObjects = {}
+	
+	-- Create object pools
+	self.framePool = ObjectPool.new(
+		function()
+			local frame = Instance.new("Frame")
+			frame.BackgroundTransparency = 1
+			frame.BorderSizePixel = 0
+			return frame
+		end,
+		function(frame)
+			frame.Parent = nil
+			frame.Name = "Pooled"
+			frame.Size = UDim2.fromScale(0, 0)
+			frame.Position = UDim2.fromScale(0, 0)
+			frame:ClearAllChildren()
+		end
+	)
+	
+	self.imagePool = ObjectPool.new(
+		function()
+			local image = Instance.new("ImageLabel")
+			image.BackgroundTransparency = 1
+			image.BorderSizePixel = 0
+			return image
+		end,
+		function(image)
+			image.Parent = nil
+			image.Image = ""
+			image.ImageColor3 = Color3.new(1, 1, 1)
+		end
+	)
+	
+	-- Create caches
+	self.scaleCache = Cache.new(CONFIG.MAX_CACHE_SIZE)
+	self.textSizeCache = Cache.new(CONFIG.MAX_CACHE_SIZE)
+	
+	-- Cleanup task
+	self.cleanupConnection = nil
+	self:StartCleanupTask()
+	
+	return self
+end
+
+function BitmapFontRenderer:StartCleanupTask()
+	if self.cleanupConnection then return end
+	
+	local lastCleanup = os.clock()
+	self.cleanupConnection = RunService.Heartbeat:Connect(function()
+		if os.clock() - lastCleanup >= CONFIG.CLEANUP_INTERVAL then
+			lastCleanup = os.clock()
+			self:Cleanup()
+		end
+	end)
+end
+
+function BitmapFontRenderer:Cleanup()
+	-- Clean up destroyed text objects
+	for textObject, data in pairs(self.textObjects) do
+		if not textObject:IsDescendantOf(game) then
+			if data.container then
+				self:ReleaseContainer(data.container)
+			end
+			self.textObjects[textObject] = nil
+		end
+	end
+end
+
+function BitmapFontRenderer:LoadFont(name: string, spritesheet: string, fntData: string)
+	local font = {
+		spritesheet = spritesheet,
+		chars = {},
+		kernings = {},
+		lineHeight = CONFIG.DEFAULT_LINE_HEIGHT,
+	}
+	
+	local lines = string.split(fntData, "\n")
+	
+	assert(#lines >= 4, "Invalid .fnt data: Less than 4 lines")
+	
+	-- Parse header
+	for i = 1, math.min(4, #lines) do
+		local line = lines[i]
+		
+		if i == 1 then
+			font.face = ParseValue(line, "face")
+		elseif i == 2 then
+			font.lineHeight = ParseValue(line, "lineHeight") or font.lineHeight
+			font.scaleW = ParseValue(line, "scaleW")
+			font.scaleH = ParseValue(line, "scaleH")
+		elseif i == 4 then
+			local charCount = ParseValue(line, "count")
+			
+			-- Parse characters
+			for j = 1, charCount do
+				local charLine = lines[4 + j]
+				if not charLine then break end
+				
+				local letter = ParseValue(charLine, "letter")
+				if letter then
+					font.chars[letter] = {
+						id = ParseValue(charLine, "id"),
+						x = ParseValue(charLine, "x"),
+						y = ParseValue(charLine, "y"),
+						width = ParseValue(charLine, "width"),
+						height = ParseValue(charLine, "height"),
+						xoffset = ParseValue(charLine, "xoffset"),
+						yoffset = ParseValue(charLine, "yoffset"),
+						xadvance = ParseValue(charLine, "xadvance"),
+					}
+				end
+			end
+		end
+	end
+	
+	self.loadedFonts[name] = font
+end
+
+function BitmapFontRenderer:LoadFonts(fontsTable: table)
+	for fontName, fontData in pairs(fontsTable) do
+		if typeof(fontName) ~= "string" then
+			warn("Font name must be a string")
+			continue
+		end
+		
+		if typeof(fontData) ~= "table" then
+			warn("Font data must be a table")
+			continue
+		end
+		
+		if not fontData.img or not fontData.fnt then
+			warn("Font data must contain 'img' and 'fnt' fields")
+			continue
+		end
+		
+		self:LoadFont(fontName, fontData.img, fontData.fnt)
+	end
+end
+
+function BitmapFontRenderer:GetAlignment(textObject: GuiObject): (EnumItem, EnumItem)
+	local hAlign = Enum.HorizontalAlignment.Left
+	local vAlign = Enum.VerticalAlignment.Top
+	
+	if textObject.TextXAlignment == Enum.TextXAlignment.Center then
+		hAlign = Enum.HorizontalAlignment.Center
+	elseif textObject.TextXAlignment == Enum.TextXAlignment.Right then
+		hAlign = Enum.HorizontalAlignment.Right
+	end
+	
+	if textObject.TextYAlignment == Enum.TextYAlignment.Center then
+		vAlign = Enum.VerticalAlignment.Center
+	elseif textObject.TextYAlignment == Enum.TextYAlignment.Bottom then
+		vAlign = Enum.VerticalAlignment.Bottom
+	end
+	
+	return hAlign, vAlign
+end
+
+function BitmapFontRenderer:CalculateTextSize(text: string, font: table, maxWidth: number, wrapping: boolean): Vector2
+	-- Cache key
+	local cacheKey = string.format("%s_%s_%d_%s", text, font.face or "default", maxWidth, tostring(wrapping))
+	local cached = self.textSizeCache:Get(cacheKey)
+	if cached then return cached end
+	
+	local currentLineWidth = 0
+	local currentLineHeight = 0
+	local totalWidth = 0
+	local totalHeight = 0
+	
+	local words = string.split(text, " ")
+	local tags = FindImageTags(text)
+	
+	for wordIndex, word in ipairs(words) do
+		local wordWidth = 0
+		local wordHeight = 0
+		
+		-- Add space if not last word
+		if wordIndex < #words then
+			word = word .. " "
+		end
+		
+		-- Calculate word dimensions
+		for i = 1, #word do
+			local char = string.sub(word, i, i)
+			local charData = font.chars[char] or font.chars[" "]
+			
+			if charData then
+				wordWidth += charData.xadvance
+				wordHeight = math.max(wordHeight, charData.height + charData.yoffset)
+			end
+		end
+		
+		-- Check wrapping
+		if wrapping and currentLineWidth + wordWidth > maxWidth and currentLineWidth > 0 then
+			totalWidth = math.max(totalWidth, currentLineWidth)
+			totalHeight += currentLineHeight
+			currentLineWidth = wordWidth
+			currentLineHeight = wordHeight
+		else
+			currentLineWidth += wordWidth
+			currentLineHeight = math.max(currentLineHeight, wordHeight)
+		end
+	end
+	
+	totalWidth = math.max(totalWidth, currentLineWidth)
+	totalHeight += currentLineHeight
+	
+	local result = Vector2.new(totalWidth, totalHeight)
+	self.textSizeCache:Set(cacheKey, result)
+	
+	return result
+end
+
+function BitmapFontRenderer:CalculateScale(textObject: GuiObject, fontName: string): number
+	local font = self.loadedFonts[fontName]
+	if not font then
+		warn("Font not loaded:", fontName)
+		return 1
+	end
+	
+	-- Get padding
+	local padding = Vector2.zero
+	local uiPadding = textObject:FindFirstChildOfClass("UIPadding")
+	if uiPadding then
+		local pxOffset = uiPadding.PaddingLeft.Offset + uiPadding.PaddingRight.Offset
+		local pyOffset = uiPadding.PaddingTop.Offset + uiPadding.PaddingBottom.Offset
+		local pxScale = (uiPadding.PaddingLeft.Scale + uiPadding.PaddingRight.Scale) * textObject.AbsoluteSize.X
+		local pyScale = (uiPadding.PaddingTop.Scale + uiPadding.PaddingBottom.Scale) * textObject.AbsoluteSize.Y
+		padding = Vector2.new(pxOffset + pxScale, pyOffset + pyScale)
+	end
+	
+	local availableSize = textObject.AbsoluteSize - padding
+	
+	-- Get text
+	local text = textObject.Text
+	if textObject:IsA("TextBox") and #text == 0 then
+		text = textObject.PlaceholderText
+	end
+	
+	if #text == 0 then return 1 end
+	
+	-- Calculate text size
+	local wrapping = textObject.TextWrapped and not textObject:HasTag("StayOnOneLine")
+	local textSize = self:CalculateTextSize(text, font, availableSize.X, wrapping)
+	
+	if textSize.X == 0 or textSize.Y == 0 then return 1 end
+	
+	-- Calculate scale
+	local scaleX = availableSize.X / textSize.X
+	local scaleY = availableSize.Y / textSize.Y
+	
+	-- Handle automatic sizing
+	if textObject:HasTag("automaticSizeX") then scaleX = 1 end
+	if textObject:HasTag("automaticSizeY") then scaleY = 1 end
+	
+	return math.min(1, math.min(scaleX, scaleY))
+end
+
+function BitmapFontRenderer:CreateCharacter(char: string, fontName: string, color: Color3): Frame?
+	local font = self.loadedFonts[fontName]
+	local charData = font.chars[char]
+	
+	if not charData then return nil end
+	
+	local frame = self.framePool:Get()
+	frame.Size = UDim2.fromScale(charData.xadvance / font.lineHeight, 1)
+	frame.SizeConstraint = Enum.SizeConstraint.RelativeYY
+	frame.Name = char
+	
+	local image = self.imagePool:Get()
+	image.Parent = frame
+	image.Image = font.spritesheet
+	image.ImageColor3 = color
+	image.ImageRectOffset = Vector2.new(charData.x, charData.y)
+	image.ImageRectSize = Vector2.new(charData.width, charData.height)
+	image.Size = UDim2.fromScale(charData.width / charData.xadvance, charData.height / font.lineHeight)
+	image.Position = UDim2.fromScale(charData.xoffset / charData.xadvance, charData.yoffset / font.lineHeight)
+	
+	return frame
+end
+
+function BitmapFontRenderer:CreateTag(tagText: string): Frame?
+	local tagType, id, dimensions = ParseImageTag(tagText)
+	if not tagType then return nil end
+	
+	local frame = self.framePool:Get()
+	frame.Size = UDim2.fromScale(dimensions[1] * dimensions[2], dimensions[2])
+	frame.SizeConstraint = Enum.SizeConstraint.RelativeYY
+	frame.Name = "Tag"
+	
+	if tagType == "IMAGE" then
+		local image = self.imagePool:Get()
+		image.Parent = frame
+		image.Image = "rbxassetid://" .. tostring(id)
+		image.Size = UDim2.fromScale(1, 1)
+		image.Position = UDim2.fromScale(0.5, 0.5)
+		image.AnchorPoint = Vector2.new(0.5, 0.5)
+	end
+	
+	return frame
+end
+
+function BitmapFontRenderer:ReleaseContainer(container: Frame)
+	for _, child in ipairs(container:GetChildren()) do
+		if child:IsA("Frame") then
+			-- Release nested frames
+			for _, nested in ipairs(child:GetChildren()) do
+				if nested:IsA("ImageLabel") then
+					self.imagePool:Release(nested)
+				elseif nested:IsA("Frame") then
+					for _, image in ipairs(nested:GetChildren()) do
+						if image:IsA("ImageLabel") then
+							self.imagePool:Release(image)
+						end
+					end
+					self.framePool:Release(nested)
+				end
+			end
+			self.framePool:Release(child)
+		end
+	end
+	container:Destroy()
+end
+
+function BitmapFontRenderer:UpdateText(textObject: GuiObject, fontName: string)
+	-- Check if custom font is disabled
+	if textObject:GetAttribute("NoCustomFont") then return end
+	
+	local font = self.loadedFonts[fontName]
+	if not font then
+		warn("Font not loaded:", fontName)
+		return
+	end
+	
+	-- Get text
+	local text = textObject.Text
+	if textObject:IsA("TextBox") and #text == 0 then
+		text = textObject.PlaceholderText
+	end
+	
+	-- Remove old container
+	local oldContainer = textObject:FindFirstChild("GDFont")
+	if oldContainer then
+		if self.textObjects[textObject] and self.textObjects[textObject].container == oldContainer then
+			self:ReleaseContainer(oldContainer)
+		else
+			oldContainer:Destroy()
+		end
+	end
+	
+	-- Create new container
+	local container = Instance.new("Frame")
+	container.Name = "GDFont"
+	container.AnchorPoint = Vector2.new(0.5, 0.5)
+	container.Position = UDim2.fromScale(0.5, 0.5)
+	container.Size = UDim2.fromScale(1, 1)
+	container.BackgroundTransparency = 1
+	container.BorderSizePixel = 0
+	container.Visible = false
+	container.Parent = textObject
+	
+	-- Create layout
+	local layout = Instance.new("UIListLayout")
+	layout.Parent = container
+	local hAlign, vAlign = self:GetAlignment(textObject)
+	layout.HorizontalAlignment = hAlign
+	layout.VerticalAlignment = vAlign
+	layout.FillDirection = Enum.FillDirection.Horizontal
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	
+	-- Handle wrapping
+	local shouldWrap = textObject.TextWrapped and not textObject:HasTag("StayOnOneLine")
+	layout.Wraps = shouldWrap
+	
+	-- Calculate scale
+	local scale = self:CalculateScale(textObject, fontName)
+	local scaledLineHeight = font.lineHeight / textObject.AbsoluteSize.Y * scale
+	
+	-- Create text elements
+	local words = string.split(text, " ")
+	local tags = FindImageTags(text)
+	
+	for wordIndex, word in ipairs(words) do
+		-- Add space if not last word
+		if wordIndex < #words then
+			word = word .. " "
+		end
+		
+		-- Create word container
+		local wordFrame = self.framePool:Get()
+		wordFrame.Parent = container
+		wordFrame.Size = UDim2.fromScale(0, scaledLineHeight)
+		wordFrame.SizeConstraint = Enum.SizeConstraint.RelativeYY
+		wordFrame.Name = word
+		wordFrame.LayoutOrder = wordIndex
+		
+		local wordLayout = Instance.new("UIListLayout")
+		wordLayout.Parent = wordFrame
+		wordLayout.HorizontalAlignment = hAlign
+		wordLayout.VerticalAlignment = vAlign
+		wordLayout.FillDirection = Enum.FillDirection.Horizontal
+		wordLayout.SortOrder = Enum.SortOrder.LayoutOrder
+		
+		-- Create characters
+		for i = 1, #word do
+			local char = string.sub(word, i, i)
+			local charFrame = self:CreateCharacter(char, fontName, textObject.TextColor3)
+			
+			if charFrame then
+				charFrame.Parent = wordFrame
+				charFrame.LayoutOrder = i
+			end
+		end
+		
+		-- Calculate word width
+		task.defer(function()
+			if not wordFrame.Parent then return end
+			local wordWidth = wordLayout.AbsoluteContentSize.X
+			wordFrame.Size = UDim2.fromScale(wordWidth / wordFrame.AbsoluteSize.Y * scaledLineHeight, scaledLineHeight)
+		end)
+	end
+	
+	-- Hide original text
+	textObject.TextTransparency = 1
+	
+	-- Handle automatic sizing
+	task.defer(function()
+		RunService.RenderStepped:Wait()
+		
+		if not container.Parent then return end
+		
+		container.Visible = true
+		
+		local target = textObject:HasTag("IsContainerChild") and textObject.Parent or textObject
+		
+		if textObject:HasTag("automaticSizeX") or textObject:HasTag("automaticSizeY") then
+			local xOffset = textObject:HasTag("automaticSizeX") and layout.AbsoluteContentSize.X or 0
+			local yOffset = textObject:HasTag("automaticSizeY") and layout.AbsoluteContentSize.Y or 0
+			
+			target.Size = UDim2.new(
+				target.Size.X.Scale, xOffset,
+				target.Size.Y.Scale, yOffset
+			)
+		end
+	end)
+	
+	-- Store reference
+	self.textObjects[textObject] = {
+		container = container,
+		fontName = fontName,
+	}
+end
+
+function BitmapFontRenderer:Destroy()
+	if self.cleanupConnection then
+		self.cleanupConnection:Disconnect()
+		self.cleanupConnection = nil
+	end
+	
+	for textObject, data in pairs(self.textObjects) do
+		if data.container then
+			self:ReleaseContainer(data.container)
+		end
+	end
+	
+	self.framePool:Clear()
+	self.imagePool:Clear()
+	self.scaleCache:Clear()
+	self.textSizeCache:Clear()
+	
+	table.clear(self.textObjects)
+	table.clear(self.loadedFonts)
+end
+
+-- ============================================================================
+-- JUKEBOX MAIN SCRIPT
+-- ============================================================================
+
+local u = "https://raw.githubusercontent.com/NetlessScripter/Jukebox/refs/heads/main/achievement_01.ogg"
+local f = "Achievement01.ogg"
+
+if not isfile(f) then
+	writefile(f, game:HttpGet(u))
+end
+
+local g = getsynasset or getcustomasset
+local s = Instance.new("Sound")
+s.Name = "Achievement01"
+s.SoundId = g(f)
+s.Volume = 1
+s.Looped = false
+s.Parent = workspace
+
+function PlayAchievementSound()
+	s:Play()
+end
+
+local lp = game:GetService("Players").LocalPlayer
+local HttpService = game:GetService("HttpService")
+local UIS = game:GetService("UserInputService")
+local Debris = game:GetService("Debris")
+local TweenService = game:GetService("TweenService")
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local SoundService = game:GetService("SoundService")
+
+-- Debug logging
+local DEBUG_MODE = true
+local debugLog = {}
+local function log(msg)
+	if DEBUG_MODE then
+		print("[JUKEBOX] " .. tostring(msg))
+		table.insert(debugLog, os.date("%X") .. " - " .. tostring(msg))
+	end
+end
+
+-- ============================================================================
+-- CUSTOM FONT INTEGRATION
+-- ============================================================================
+
+local fontRenderer = nil
+local FONT_NAME = "GeometryDash"  -- Change this to your font name
+local processedElements = {}
+local ENABLE_CUSTOM_FONT = true  -- Set to false to disable custom font
+
+-- Initialize font renderer
+local function initializeFontSystem()
+	if not ENABLE_CUSTOM_FONT then
+		log("[Font] Custom font disabled")
+		return false
+	end
+	
+	fontRenderer = BitmapFontRenderer.new()
+	
+	-- Load your font data here
+	-- IMPORTANT: Replace with your actual font data
+	local fontData = {
+		[FONT_NAME] = {
+			img = "rbxassetid://YOUR_SPRITESHEET_ID",  -- Replace with your font spritesheet asset ID
+			fnt = [[
+info face="GeometryDash" size=32 bold=0 italic=0 charset="" unicode=0 stretchH=100 smooth=1 aa=1 padding=0,0,0,0 spacing=0,0
+common lineHeight=32 base=26 scaleW=512 scaleH=512 pages=1 packed=0
+page id=0 file="font.png"
+chars count=95
+char id=32 letter=" " x=0 y=0 width=0 height=0 xoffset=0 yoffset=0 xadvance=8
+char id=33 letter="!" x=0 y=0 width=6 height=22 xoffset=1 yoffset=4 xadvance=8
+-- Add all your character definitions here
+-- This is just a placeholder - you need to provide the full .fnt file data
+]]
+		}
+	}
+	
+	local success, err = pcall(function()
+		fontRenderer:LoadFonts(fontData)
+	end)
+	
+	if not success then
+		warn("[Font] Failed to load fonts: " .. tostring(err))
+		return false
+	end
+	
+	log("[Font] Font system initialized successfully!")
+	return true
+end
+
+-- Apply custom font to a text element
+local function applyCustomFont(element)
+	if not ENABLE_CUSTOM_FONT or not fontRenderer then return end
+	if not element then return end
+	
+	-- Skip if already processed or tagged to skip
+	if processedElements[element] or element:GetAttribute("NoCustomFont") then
+		return
+	end
+	
+	-- Only process TextLabels and TextBoxes
+	if not (element:IsA("TextLabel") or element:IsA("TextBox")) then
+		return
+	end
+	
+	processedElements[element] = true
+	
+	-- Apply font with error handling
+	task.spawn(function()
+		local success, err = pcall(function()
+			fontRenderer:UpdateText(element, FONT_NAME)
+		end)
+		
+		if not success then
+			warn("[Font] Error applying font to " .. element.Name .. ": " .. tostring(err))
+			processedElements[element] = nil  -- Allow retry
+		end
+	end)
+	
+	-- Monitor for text changes
+	element:GetPropertyChangedSignal("Text"):Connect(function()
+		if fontRenderer and not element:GetAttribute("NoCustomFont") then
+			task.spawn(function()
+				pcall(function()
+					fontRenderer:UpdateText(element, FONT_NAME)
+				end)
+			end)
+		end
+	end)
+	
+	-- Cleanup when destroyed
+	element.AncestryChanged:Connect(function(_, parent)
+		if not parent then
+			processedElements[element] = nil
+		end
+	end)
+end
+
+-- Recursively apply font to container
+local function applyFontToContainer(container)
+	if not ENABLE_CUSTOM_FONT or not fontRenderer or not container then return end
+	
+	-- Apply to all text elements
+	for _, child in ipairs(container:GetDescendants()) do
+		if child:IsA("TextLabel") or child:IsA("TextBox") then
+			applyCustomFont(child)
+		end
+	end
+	
+	-- Monitor for new elements
+	container.DescendantAdded:Connect(function(child)
+		if child:IsA("TextLabel") or child:IsA("TextBox") then
+			task.wait(0.05)  -- Small delay to ensure element is set up
+			applyCustomFont(child)
+		end
+	end)
+end
+
+-- ============================================================================
+-- JUKEBOX CORE FUNCTIONALITY
+-- ============================================================================
+
+-- Song preference storage
+local songPreferences = {}
+local favoriteSongs = {}
+local resetStates = {}
+local SAVE_FILE = "jukebox_preferences.json"
+local FAVORITES_FILE = "jukebox_favorites.json"
+local RESET_FILE = "jukebox_reset_states.json"
+
+local function loadPreferences()
+	if type(readfile) == "function" and type(isfile) == "function" then
+		local ok, exists = pcall(isfile, SAVE_FILE)
+		if ok and exists then
+			local ok2, data = pcall(readfile, SAVE_FILE)
+			if ok2 and data then
+				local ok3, decoded = pcall(function() return HttpService:JSONDecode(data) end)
+				if ok3 and type(decoded) == "table" then
+					songPreferences = decoded
+					local count = 0
+					for _ in pairs(songPreferences) do count = count + 1 end
+					log("Loaded preferences: " .. count .. " entries")
+				end
+			end
+		end
+		
+		-- Load favorites
+		local ok4, exists2 = pcall(isfile, FAVORITES_FILE)
+		if ok4 and exists2 then
+			local ok5, data2 = pcall(readfile, FAVORITES_FILE)
+			if ok5 and data2 then
+				local ok6, decoded2 = pcall(function() return HttpService:JSONDecode(data2) end)
+				if ok6 and type(decoded2) == "table" then
+					favoriteSongs = decoded2
+					local count = 0
+					for _ in pairs(favoriteSongs) do count = count + 1 end
+					log("Loaded favorites: " .. count .. " entries")
+				end
+			end
+		end
+		
+		-- Load reset states
+		local ok7, exists3 = pcall(isfile, RESET_FILE)
+		if ok7 and exists3 then
+			local ok8, data3 = pcall(readfile, RESET_FILE)
+			if ok8 and data3 then
+				local ok9, decoded3 = pcall(function() return HttpService:JSONDecode(data3) end)
+				if ok9 and type(decoded3) == "table" then
+					resetStates = decoded3
+					log("Loaded reset states")
+				end
+			end
+		end
+	end
+	log("Loaded all data")
+end
+
+local function savePreferences()
+	if type(writefile) == "function" then
+		local ok, encoded = pcall(function() return HttpService:JSONEncode(songPreferences) end)
+		if ok and encoded then
+			pcall(writefile, SAVE_FILE, encoded)
+			log("Saved preferences")
+		end
+	end
+end
+
+local function saveFavorites()
+	if type(writefile) == "function" then
+		local ok, encoded = pcall(function() return HttpService:JSONEncode(favoriteSongs) end)
+		if ok and encoded then
+			pcall(writefile, FAVORITES_FILE, encoded)
+			log("Saved favorites")
+		end
+	end
+end
+
+local function saveResetStates()
+	if type(writefile) == "function" then
+		local ok, encoded = pcall(function() return HttpService:JSONEncode(resetStates) end)
+		if ok and encoded then
+			pcall(writefile, RESET_FILE, encoded)
+			log("Saved reset states")
+		end
+	end
+end
+
+-- Load preferences at startup
+loadPreferences()
+
+-- Wait for UI
+local s
+local waitLimit = 30
+local t0 = tick()
+log("Waiting for OnlineLevelViewMenu UI...")
+repeat
+	s = lp.PlayerGui:FindFirstChild("MainUI")
+		and lp.PlayerGui.MainUI:FindFirstChild("States")
+		and lp.PlayerGui.MainUI.States:FindFirstChild("OnlineLevelViewMenu")
+		and lp.PlayerGui.MainUI.States.OnlineLevelViewMenu:FindFirstChild("MiddleItems")
+		and lp.PlayerGui.MainUI.States.OnlineLevelViewMenu.MiddleItems:FindFirstChild("SongInfo")
+	if tick() - t0 > waitLimit then 
+		log("WARN: UI timeout after " .. waitLimit .. "s")
+		break 
+	end
+	task.wait()
+until s
+
+if s then
+	log("UI found")
+else
+	log("ERROR: UI not found")
+end
+
+-- Asset loading
+local assetUrls = {
+	"https://raw.githubusercontent.com/Fleeym/jukebox/refs/heads/main/resources/JB_PinDisc.png",
+	"https://raw.githubusercontent.com/Fleeym/jukebox/refs/heads/main/resources/JB_PinDiscRays.png",
+	"https://raw.githubusercontent.com/Fleeym/jukebox/refs/heads/main/resources/JB_ListLogo.png",
+	"https://raw.githubusercontent.com/NetlessScripter/Jukebox/refs/heads/main/loadingCircle.png"
+}
+local assetFiles = {"JB_PinDisc.png","JB_PinDiscRays.png","JB_ListLogo.png","loadingCircle.png"}
+
+local getAsset = getsynasset or getcustomasset
+
+local function safeIsFile(n)
+	if type(isfile)~="function" then return false end
+	local ok,res = pcall(isfile,n)
+	return ok and res
+end
+
+local function safeWrite(n,b)
+	if type(writefile)~="function" then return false end
+	return pcall(writefile,n,b)
+end
+
+local function sanitize(fn) 
+	fn = tostring(fn or ""):gsub("[<>:/\\|%?%*%%\"%c]","_"):gsub("%s+","_") 
+	return fn 
+end
+
+local function getFileSize(fname)
+	if type(readfile) == "function" and safeIsFile(fname) then
+		local ok, content = pcall(readfile, fname)
+		if ok and content then
+			return #content
+		end
+	end
+	return 0
+end
+
+local function formatFileSize(bytes)
+	if bytes < 1024 then
+		return bytes .. "B"
+	elseif bytes < 1024*1024 then
+		return string.format("%.1fKB", bytes/1024)
+	else
+		return string.format("%.1fMB", bytes/(1024*1024))
+	end
+end
+
+-- Download assets
+for i=1,4 do
+	if not safeIsFile(assetFiles[i]) then
+		local ok,body = pcall(function() return game:HttpGet(assetUrls[i]) end)
+		if ok and body then 
+			safeWrite(assetFiles[i],body)
+			log("Downloaded: " .. assetFiles[i])
+		else
+			log("Failed to download: " .. assetFiles[i])
+		end
+	else
+		log("Asset exists: " .. assetFiles[i])
+	end
+end
+
+-- Clean old UI
+if s then
+	for _,c in pairs(s:GetChildren()) do
+		if c:IsA("GuiObject") and (c.Name=="JB_PinDisc" or c.Name=="JB_PinDiscRays") then
+			log("Cleaning old element: " .. c.Name)
+			c:Destroy()
+		end
+	end
+end
+
+-- UI setup
+local ms = Vector2.new(30,30)
+local rs = Vector2.new(50,50)
+local osx,osy = -0.05,-0.1
+local sn = s and s:FindFirstChild("SongName")
+local ziBase = 10000
+local zi = (sn and sn.ZIndex) or ziBase
+if zi < ziBase then zi = ziBase end
+
+local pinButtons = {}
+local function hideAllBg()
+	for i=1,#pinButtons do 
+		local o=pinButtons[i] 
+		if o then o.BackgroundTransparency=1 end 
+	end
+end
+
+-- Pin button
+do
+	local i = Instance.new("ImageButton")
+	i.Name = "JB_PinDisc"
+	i.BackgroundTransparency = 1
+	i.Image = getAsset(assetFiles[1])
+	i.Size = UDim2.new(0,ms.X,0,ms.Y)
+	i.Position = UDim2.new(osx,0,osy,0)
+	i.ZIndex = zi + 10
+	i.Parent = s or lp:WaitForChild("PlayerGui")
+	i.MouseButton1Down:Connect(function() hideAllBg() end)
+	pinButtons[#pinButtons+1] = i
+end
+
+-- Rays
+do
+	local i = Instance.new("ImageButton")
+	i.Name = "JB_PinDiscRays"
+	i.BackgroundTransparency = 1
+	i.Image = getAsset(assetFiles[2])
+	i.ImageTransparency = 1
+	i.Size = UDim2.new(0,rs.X,0,rs.Y)
+	i.Position = UDim2.new(osx,(ms.X-rs.X)/2,osy,(ms.Y-rs.Y)/2)
+	i.ZIndex = zi + 9
+	i.Parent = s or lp:WaitForChild("PlayerGui")
+	i.MouseButton1Down:Connect(function() hideAllBg() end)
+	pinButtons[#pinButtons+1] = i
+end
+
+-- Adjust positions
+for _,n in {"SongName","Username"} do
+	local o = s and s:FindFirstChild(n)
+	if o and o:IsA("GuiObject") then
+		local p = o.Position
+		o.Position = UDim2.new(p.X.Scale,p.X.Offset,p.Y.Scale+0.2,p.Y.Offset)
+	end
+end
+
+-- HTTP with retries
+local cache = {}
+local function httpGet(url, tries)
+	tries = tries or 3
+	for attempt=1, tries do
+		log("HTTP GET " .. attempt .. "/" .. tries .. ": " .. url)
+		local ok, result = pcall(function()
+			if syn and syn.request then
+				return syn.request({Url = url, Method = "GET"}).Body
+			elseif request then
+				return request({Url = url, Method = "GET"}).Body
+			else
+				return game:HttpGet(url)
+			end
+		end)
+		if ok and result and #result > 0 then
+			log("HTTP OK: " .. #result .. " bytes")
+			return result
+		else
+			log("HTTP FAIL: " .. tostring(result))
+		end
+		if attempt < tries then task.wait(0.5 * attempt) end
+	end
+	log("HTTP exhausted: " .. url)
+	return nil
+end
+
+-- Song database URLs
+local INDEX_URLS = {
+	"https://api.songfilehub.com/songs",
+	"https://songfilehub.com/api/songs/all"
+}
+
+local function tryLoadIndexes()
+	log("Attempting to load song database...")
+	local combined = {}
+	
+	for i=1, #INDEX_URLS do
+		local body = httpGet(INDEX_URLS[i], 2)
+		if body then
+			local ok, data = pcall(function() 
+				return HttpService:JSONDecode(body) 
+			end)
+			if ok and type(data) == "table" then
+				log("Parsed API response " .. i)
+				if #data > 0 then
+					for j=1, #data do combined[#combined+1] = data[j] end
+				else
+					for k,v in pairs(data) do
+						if type(v) == "table" then
+							if #v > 0 then
+								for m=1, #v do combined[#combined+1] = v[m] end
+							else
+								combined[#combined+1] = v
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+	
+	log("Total entries: " .. #combined)
+	return combined
+end
+
+-- Build storage URL
+local function buildStorageUrl(songId, fileHash)
+	if fileHash and songId then
+		return ("https://storage.hpsk.me/api/bucket/file/%s?download=true&name=%s"):format(fileHash, songId)
+	elseif fileHash then
+		return ("https://storage.hpsk.me/api/bucket/file/%s"):format(fileHash)
+	end
+	return nil
+end
+
+-- Parse songName field (format: "Artist - Title" or just "Title")
+local function parseSongName(songNameField)
+	if not songNameField or songNameField == "" then
+		return "Unknown", "Unknown"
+	end
+	
+	local str = tostring(songNameField)
+	-- Try to split on " - " (artist - title format)
+	local dashPos = str:find(" %- ")
+	if dashPos then
+		local artist = str:sub(1, dashPos - 1):gsub("^%s*(.-)%s*$", "%1")
+		local title = str:sub(dashPos + 3):gsub("^%s*(.-)%s*$", "%1")
+		return artist ~= "" and artist or "Unknown", title ~= "" and title or "Unknown"
+	end
+	
+	-- No dash found, treat whole thing as title
+	return "Unknown", str:gsub("^%s*(.-)%s*$", "%1")
+end
+
+-- Search indexes
+local function indexSearch(q, idxList)
+	log("Index search for: " .. q)
+	local out = {}
+	if not idxList or #idxList == 0 then return out end
+	
+	local ql = tostring(q):lower()
+	
+	for i=1, #idxList do
+		local it = idxList[i]
+		if type(it) == "table" then
+			local matched = false
+			-- Search in songName (actual song), name (label), and songID
+			for _,field in ipairs({"songName","name","songID","_id"}) do
+				local val = it[field]
+				if val and tostring(val):lower():find(ql, 1, true) then
+					matched = true
+					break
+				end
+			end
+			
+			if matched then
+				-- Use the correct ID field for SongFileHub
+				local songId = it._id or it.id or it.songId or it.song_id or it.songID
+				
+				-- Parse songName for actual artist and title
+				local artist, title = parseSongName(it.songName)
+				
+				-- Get download URL
+				local url = it.downloadUrl or it.download_url or it.url
+				if not url and songId then
+					url = ("https://api.songfilehub.com/song/%s?download=true&name=%s"):format(
+						tostring(songId), 
+						tostring(it.songID or songId)
+					)
+				end
+				
+				if url then
+					out[#out+1] = {
+						title = title,
+						artist = artist,
+						id = tostring(songId or math.random(1,999999)),
+						raw = url
+					}
+					log("Match: " .. title .. " by " .. artist)
+				end
+			end
+		end
+	end
+	
+	log("Index results: " .. #out)
+	return out
+end
+
+-- Main search
+local function searchSFH(q)
+	log("=== SEARCH: " .. q .. " ===")
+	if not q or q == "" then return {}, "EMPTY" end
+	if cache[q] then return cache[q], "CACHED" end
+	
+	-- Check if query is a numeric ID
+	local numericId = tonumber(q)
+	if numericId then
+		log("Detected numeric ID search: " .. numericId)
+		
+		-- Try direct ID lookup
+		local idSearchUrls = {
+			"https://api.songfilehub.com/song/" .. numericId,
+			"https://songfilehub.com/api/songs/" .. numericId
+		}
+		
+		for i=1, #idSearchUrls do
+			local body = httpGet(idSearchUrls[i], 2)
+			if body then
+				local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
+				if ok and type(data) == "table" then
+					local song = data.song or data.data or data
+					if song and type(song) == "table" then
+						local id = song._id or song.id or song.songId or song.song_id or numericId
+						local url = song.downloadUrl or song.download_url or song.url
+						
+						if not url and id then
+							url = ("https://api.songfilehub.com/song/%s?download=true&name=%s"):format(
+								tostring(id),
+								tostring(song.songID or id)
+							)
+						end
+						
+						if url then
+							-- Parse songName for proper metadata
+							local artist, title = parseSongName(song.songName)
+							
+							local result = {
+								{
+									title = title,
+									artist = artist,
+									id = tostring(id),
+									raw = url
+								}
+							}
+							cache[q] = result
+							return result, "ID_DIRECT"
+						end
+					end
+				end
+			end
+		end
+	end
+	
+	local idx = tryLoadIndexes()
+	if idx and #idx > 0 then
+		local res = indexSearch(q, idx)
+		if #res > 0 then
+			cache[q] = res
+			return res, "INDEX_" .. #res
+		end
+	end
+	
+	log("Trying SFH song search API...")
+	local searchUrls = {
+		"https://api.songfilehub.com/search?q=" .. HttpService:UrlEncode(q),
+		"https://api.songfilehub.com/song/search?query=" .. HttpService:UrlEncode(q)
+	}
+	
+	for i=1, #searchUrls do
+		local body = httpGet(searchUrls[i], 2)
+		if body then
+			local ok, data = pcall(function() return HttpService:JSONDecode(body) end)
+			if ok and type(data) == "table" then
+				local results = data.results or data.songs or data.data or (type(data[1]) == "table" and data) or {}
+				local out = {}
+				
+				for j=1, #results do
+					local song = results[j]
+					if song then
+						local id = song._id or song.id or song.songId or song.song_id
+						local url = song.downloadUrl or song.download_url or song.url
+						
+						if not url and id then
+							url = ("https://api.songfilehub.com/song/%s?download=true&name=%s"):format(
+								tostring(id),
+								tostring(song.songID or id)
+							)
+						end
+						
+						if url then
+							-- Parse the songName field for proper artist and title
+							local artist, title = parseSongName(song.songName)
+							
+							out[#out+1] = {
+								title = title,
+								artist = artist,
+								id = tostring(id or math.random(1,999999)),
+								raw = url
+							}
+						end
+					end
+				end
+				
+				if #out > 0 then
+					cache[q] = out
+					return out, "API_" .. #out
+				end
+			end
+		end
+	end
+	
+	log("NO RESULTS")
+	return {}, "NONE"
+end
+
+-- Multi-ID SoundLink implementation
+local activeMirrors = {}  -- Track mirrors by original ID
+
+local function SoundLink(originalId, url)
+	local fname = url:match("^.+/(.+)$") or ("sound_"..tostring(math.random(100000,999999)))
+	local downloaded = false
+	if not safeIsFile(fname) then
+		local body = httpGet(url, 3)
+		if body then
+			safeWrite(fname, body)
+			downloaded = true
+		end
+	else
+		downloaded = true
+	end
+
+	local assetPath = getAsset(fname)
+	
+	local function killOld(src, origId)
+		local kids = Workspace:GetChildren()
+		for i = 1, #kids do
+			local v = kids[i]
+			if v:IsA("Sound") and v.Name == fname then
+				v:Destroy()
+			end
+		end
+		if src and src:FindFirstChild("MirrorAttached_" .. origId) then
+			src:FindFirstChild("MirrorAttached_" .. origId):Destroy()
+		end
+	end
+
+	local function makeMirror(src)
+		if not src then return end
+		local tagName = "MirrorAttached_" .. originalId
+		if src:FindFirstChild(tagName) then return end
+		killOld(src, originalId)
+		src.Volume = 0
+		local s = Instance.new("Sound")
+		s.Name = fname
+		if assetPath then
+			s.SoundId = assetPath
+		else
+			s.SoundId = originalId
+		end
+		s.Volume = 1
+		s.Looped = src.Looped
+		s.PlaybackSpeed = src.PlaybackSpeed
+		s.TimePosition = src.TimePosition
+		s.Parent = Workspace
+		local tag = Instance.new("StringValue")
+		tag.Name = tagName
+		tag.Value = originalId
+		tag.Parent = src
+		
+		if not activeMirrors[originalId] then
+			activeMirrors[originalId] = {}
+		end
+		activeMirrors[originalId][src] = {mirror = s, tag = tag}
+		
+		local dead = false
+		local function sync()
+			if dead then return end
+			if not src.Parent then
+				dead = true
+				if s and s.Parent then pcall(function() s:Destroy() end) end
+				if tag and tag.Parent then pcall(function() tag:Destroy() end) end
+				if activeMirrors[originalId] then
+					activeMirrors[originalId][src] = nil
+				end
+				return
+			end
+			pcall(function() s.Looped = src.Looped end)
+			pcall(function() s.PlaybackSpeed = src.PlaybackSpeed end)
+			pcall(function() s.TimePosition = src.TimePosition end)
+			if src.Playing and not s.Playing then
+				pcall(function() s:Play() end)
+			elseif not src.Playing and s.Playing then
+				pcall(function() s:Pause() end)
+			end
+		end
+		local con1 = src:GetPropertyChangedSignal("Playing"):Connect(sync)
+		local con2 = src:GetPropertyChangedSignal("TimePosition"):Connect(function()
+			if not dead then
+				pcall(function() s.TimePosition = src.TimePosition end)
+			end
+		end)
+		local con3 = src.AncestryChanged:Connect(function(_, parent)
+			if not parent then
+				dead = true
+				pcall(function() s:Destroy() end)
+				pcall(function() tag:Destroy() end)
+				if con1 then con1:Disconnect() end
+				if con2 then con2:Disconnect() end
+				if con3 then con3:Disconnect() end
+				if activeMirrors[originalId] then
+					activeMirrors[originalId][src] = nil
+				end
+			end
+		end)
+		sync()
+	end
+
+	local function watchContainer(c)
+		for _, v in pairs(c:GetDescendants()) do
+			if v:IsA("Sound") and v.SoundId == originalId then
+				makeMirror(v)
+			end
+		end
+		c.DescendantAdded:Connect(function(v)
+			if v:IsA("Sound") and v.SoundId == originalId then
+				makeMirror(v)
+			end
+		end)
+	end
+
+	watchContainer(Workspace)
+	watchContainer(ReplicatedStorage)
+	watchContainer(SoundService)
+end
+
+local function clearSoundLink(originalId)
+	log("Clearing SoundLink for: " .. tostring(originalId))
+	
+	-- Clear all mirrors for this ID
+	if activeMirrors[originalId] then
+		for src, data in pairs(activeMirrors[originalId]) do
+			if data.mirror and data.mirror.Parent then
+				pcall(function() data.mirror:Destroy() end)
+			end
+			if data.tag and data.tag.Parent then
+				pcall(function() data.tag:Destroy() end)
+			end
+			-- Restore original volume
+			if src and src.Parent then
+				pcall(function() src.Volume = 1 end)
+			end
+		end
+		activeMirrors[originalId] = nil
+	end
+	
+	-- Clean up any remaining mirror sounds in workspace
+	for _, v in pairs(Workspace:GetChildren()) do
+		if v:IsA("Sound") and v.Name:find("sound_") then
+			v:Destroy()
+		end
+	end
+end
+
+-- Track currently playing song
+local currentSongLabel = nil
+local currentAuthorLabel = nil
+local currentSongId = nil
+local currentSongIdLabel = nil
+local originalSongId = nil
+local activeMirrorSound = nil
+local lastKnownOriginalId = nil
+
+-- Get original song ID from UI
+local function getOriginalSongId()
+	local songInfo = lp.PlayerGui:FindFirstChild("MainUI")
+		and lp.PlayerGui.MainUI:FindFirstChild("States")
+		and lp.PlayerGui.MainUI.States:FindFirstChild("OnlineLevelViewMenu")
+		and lp.PlayerGui.MainUI.States.OnlineLevelViewMenu:FindFirstChild("MiddleItems")
+		and lp.PlayerGui.MainUI.States.OnlineLevelViewMenu.MiddleItems:FindFirstChild("SongInfo")
+		and lp.PlayerGui.MainUI.States.OnlineLevelViewMenu.MiddleItems.SongInfo:FindFirstChild("SongId")
+	
+	if songInfo then
+		local text = songInfo.Text
+		local id = text:match("ID:%s*(%d+)")
+		if id then
+			currentSongIdLabel = songInfo
+			return "rbxassetid://" .. id, id
+		end
+	end
+	return nil, nil
+end
+
+-- Update song display
+local function updateSongDisplay(songTitle, artistName)
+	if s then
+		local songNameLabel = s:FindFirstChild("SongName")
+		local usernameLabel = s:FindFirstChild("Username")
+		
+		if songNameLabel and songNameLabel:IsA("TextLabel") then
+			songNameLabel.Text = songTitle or "Unknown Song"
+			currentSongLabel = songNameLabel
+			log("Updated SongName: " .. (songTitle or "Unknown"))
+		end
+		
+		if usernameLabel and usernameLabel:IsA("TextLabel") then
+			usernameLabel.Text = artistName or "Unknown Artist"
+			currentAuthorLabel = usernameLabel
+			log("Updated Username: " .. (artistName or "Unknown"))
+		end
+	end
+end
+
+-- Update ID display
+local function updateIdDisplay(numericId, filename)
+	if currentSongIdLabel then
+		local fileSize = getFileSize(filename)
+		local sizeStr = formatFileSize(fileSize)
+		currentSongIdLabel.Text = "ID: " .. numericId .. " (R) NONG, SIZE: " .. sizeStr
+		log("Updated ID display: " .. currentSongIdLabel.Text)
+	end
+end
+
+-- Restore original ID display
+local function restoreOriginalIdDisplay(numericId)
+	if currentSongIdLabel then
+		currentSongIdLabel.Text = "ID: " .. numericId
+		log("Restored original ID display: " .. currentSongIdLabel.Text)
+	end
+end
+
+-- Play song and update display
+local concurrentDownloads = 0
+local maxConcurrent = 2
+local playingButtons = {}
+
+local function playFromUrl(it, btn)
+	if not it or not it.raw then return end
+	log("Playing: " .. it.title .. " by " .. it.artist)
+	
+	local id = tostring(it.id or "sfh")
+	local fname = sanitize(id) .. ".mp3"
+	
+	-- Download if needed
+	if not safeIsFile(fname) then
+		while concurrentDownloads >= maxConcurrent do task.wait(0.05) end
+		concurrentDownloads = concurrentDownloads + 1
+		
+		local b = httpGet(it.raw, 3)
+		if b and #b > 0 then
+			safeWrite(fname, b)
+			log("Downloaded " .. #b .. " bytes")
+		else
+			log("Download failed")
+			concurrentDownloads = concurrentDownloads - 1
+			return
+		end
+		concurrentDownloads = concurrentDownloads - 1
+	end
+	
+	local ok, asset = pcall(function() return getAsset(fname) end)
+	if not ok or not asset then
+		log("Asset load failed")
+		return
+	end
+	
+	-- Get original song ID
+	local fullId, numericId = getOriginalSongId()
+	if fullId then
+		originalSongId = fullId
+		log("Original Song ID: " .. tostring(originalSongId))
+		
+		-- Save preference for this level
+		songPreferences[numericId] = {
+			title = it.title,
+			artist = it.artist,
+			url = it.raw,
+			id = it.id,
+			filename = fname
+		}
+		savePreferences()
+		log("Saved preference for ID: " .. numericId)
+		
+		-- Update ID display
+		updateIdDisplay(numericId, fname)
+		
+		-- Mark as not reset
+		resetStates[numericId] = false
+		saveResetStates()
+	end
+	
+	-- Update song display
+	updateSongDisplay(it.title, it.artist)
+	
+	-- Use SoundLink to replace the song
+	if originalSongId then
+		SoundLink(originalSongId, it.raw)
+		log("SoundLink activated: " .. originalSongId .. " -> " .. it.raw)
+	end
+	
+	-- Create a sound instance to track
+	if activeMirrorSound and activeMirrorSound.Parent then
+		activeMirrorSound:Stop()
+		activeMirrorSound:Destroy()
+	end
+	
+	local snd = Instance.new("Sound")
+	snd.Name = "SFH_CurrentSong"
+	snd.SoundId = asset
+	snd.Volume = 1
+	snd.Parent = Workspace
+	activeMirrorSound = snd
+	snd:Play()
+	
+	-- Update all buttons
+	for otherBtn, _ in pairs(playingButtons) do
+		otherBtn.Image = "rbxassetid://18177735935"
+	end
+	playingButtons = {}
+	
+	if btn then
+		btn.Image = "rbxassetid://18177773008"
+		playingButtons[btn] = true
+	end
+	
+	log("Playing!")
+end
+
+-- Check and restore saved song on level change
+local function checkAndRestoreSong()
+	local fullId, numericId = getOriginalSongId()
+	
+	if not numericId then return end
+	
+	-- Check if this level has been reset
+	if resetStates[numericId] == true then
+		log("Level " .. numericId .. " is marked as reset, skipping restore")
+		return
+	end
+	
+	-- Check if this is a different level
+	if numericId ~= lastKnownOriginalId then
+		log("Level changed to ID: " .. numericId)
+		lastKnownOriginalId = numericId
+		
+		-- Check if we have a saved preference for this level
+		local pref = songPreferences[numericId]
+		if pref then
+			log("Found saved preference, restoring: " .. pref.title)
+			
+			-- Wait a moment for the UI to settle
+			task.wait(0.5)
+			
+			-- Only update display and activate SoundLink, don't play sound
+			updateSongDisplay(pref.title, pref.artist)
+			
+			if pref.filename then
+				updateIdDisplay(numericId, pref.filename)
+			end
+			
+			-- Activate SoundLink to replace the audio
+			if fullId and pref.url then
+				SoundLink(fullId, pref.url)
+				log("SoundLink activated for saved preference: " .. fullId .. " -> " .. pref.url)
+			end
+		else
+			log("No saved preference for this level")
+		end
+	end
+end
+
+-- GUI
+local currentTab = "Search"
+
+local function makeGui()
+	if lp.PlayerGui:FindFirstChild("SFHGui") then 
+		log("Destroying old SFHGui")
+		lp.PlayerGui.SFHGui:Destroy() 
+	end
+	
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "SFHGui"
+	gui.ResetOnSpawn = false
+	gui.ZIndexBehavior = Enum.ZIndexBehavior.Global
+	gui.DisplayOrder = 999999
+	gui.Enabled = false
+	gui.Parent = lp:FindFirstChild("PlayerGui") or game:GetService("CoreGui")
+	
+	-- Frame starts at 0 size for animation
+	local frame = Instance.new("ImageLabel", gui)
+	frame.Name = "Frame"
+	frame.Size = UDim2.new(0, 0, 0, 0)  -- Start at 0
+	frame.Position = UDim2.new(0.5, 0, 0.5, 0)  -- Center position
+	frame.AnchorPoint = Vector2.new(0.5, 0.5)  -- Center anchor
+	frame.Image = "rbxassetid://18807846310"
+	frame.ScaleType = Enum.ScaleType.Slice
+	frame.SliceCenter = Rect.new(100, 100, 100, 100)
+	frame.BorderSizePixel = 0
+	frame.ZIndex = 100001
+	frame.BackgroundTransparency = 1
+
+	-- Logo (bigger and moved up)
+	local logoAsset = nil
+	if getAsset and safeIsFile(assetFiles[3]) then
+		local ok, asset = pcall(function() return getAsset(assetFiles[3]) end)
+		if ok and asset then
+			logoAsset = asset
+			log("Logo loaded from file: " .. assetFiles[3])
+		else
+			log("Failed to load logo asset: " .. tostring(asset))
+		end
+	else
+		log("Logo file not found or asset function unavailable")
+	end
+	
+	if not logoAsset then
+		logoAsset = assetUrls[3]
+		log("Using direct URL for logo")
+	end
+
+	local titleImg = Instance.new("ImageLabel", frame)
+	titleImg.Name = "Title"
+	titleImg.Size = UDim2.new(0, 220, 0, 42)  -- Bigger logo
+	titleImg.Position = UDim2.new(0.5, -110, 0, -18)  -- Moved up even more
+	titleImg.BackgroundTransparency = 1
+	titleImg.Image = logoAsset
+	titleImg.ScaleType = Enum.ScaleType.Fit
+	titleImg.ZIndex = 100002
+
+	local close = Instance.new("ImageButton", frame)
+	close.Name = "Close"
+	close.Size = UDim2.new(0, 30, 0, 30)
+	close.Position = UDim2.new(1, -34, 0, 4)
+	close.Image = "rbxassetid://17188653361"
+	close.BackgroundTransparency = 1
+	close.ZIndex = 999999  -- Highest z-index to be above everything
+	
+	-- Tab container (smaller and better fitted)
+	local tabContainer = Instance.new("Frame", frame)
+	tabContainer.Name = "TabContainer"
+	tabContainer.Size = UDim2.new(1, -24, 0, 24)  -- More padding to prevent overflow
+	tabContainer.Position = UDim2.new(0, 12, 0, 32)  -- More centered
+	tabContainer.BackgroundTransparency = 1
+	tabContainer.ZIndex = 100002
+	
+	local tabButtons = {}
+	local tabs = {"Search", "Favorites", "Reset"}
+	
+	local function createTabButton(tabName, index)
+		local tabBtn = Instance.new("ImageButton", tabContainer)
+		tabBtn.Name = tabName .. "Tab"
+		tabBtn.Size = UDim2.new(0.33, -6, 1, 0)  -- More spacing between tabs
+		tabBtn.Position = UDim2.new((index-1) * 0.33, (index-1) * 3, 0, 0)
+		tabBtn.Image = "rbxassetid://18807846310"
+		tabBtn.ScaleType = Enum.ScaleType.Slice
+		tabBtn.SliceCenter = Rect.new(100, 100, 100, 100)
+		tabBtn.BackgroundTransparency = 1
+		tabBtn.ZIndex = 100003
+		
+		local tabText = Instance.new("TextLabel", tabBtn)
+		tabText.Size = UDim2.new(1, 0, 1, 0)
+		tabText.BackgroundTransparency = 1
+		tabText.Text = tabName
+		tabText.TextColor3 = Color3.new(1, 1, 1)
+		tabText.TextSize = 11  -- Smaller text for smaller tabs
+		tabText.ZIndex = 100004
+		
+		return tabBtn, tabText
+	end
+	
+	for i, tabName in ipairs(tabs) do
+		local btn, txt = createTabButton(tabName, i)
+		tabButtons[tabName] = {button = btn, text = txt}
+	end
+	
+	-- Search content (NO BLACK BACKGROUND)
+	local searchContent = Instance.new("Frame", frame)
+	searchContent.Name = "SearchContent"
+	searchContent.Size = UDim2.new(1, 0, 1, -62)  -- Adjusted for smaller tabs
+	searchContent.Position = UDim2.new(0, 0, 0, 62)  -- Adjusted for smaller tabs
+	searchContent.BackgroundTransparency = 1  -- FULLY TRANSPARENT
+	searchContent.ZIndex = 100001
+	searchContent.Visible = true
+	
+	local searchBox = Instance.new("TextBox", searchContent)
+	searchBox.Name = "SearchBox"
+	searchBox.Size = UDim2.new(1, -90, 0, 24)  -- Adjusted width for closer search button
+	searchBox.Position = UDim2.new(0, 8, 0, 0)
+	searchBox.PlaceholderText = "Search query or paste ID"
+	searchBox.Text = ""
+	searchBox.TextColor3 = Color3.new(1, 1, 1)
+	searchBox.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+	searchBox.BorderSizePixel = 0
+	searchBox.TextSize = 14
+	searchBox.ZIndex = 100002
+	
+	local searchBtn = Instance.new("ImageButton", searchContent)
+	searchBtn.Name = "SearchBtn"
+	searchBtn.Size = UDim2.new(0, 72, 0, 24)
+	searchBtn.Position = UDim2.new(1, -80, 0, 0)  -- Much closer to search box
+	searchBtn.Image = "rbxassetid://18473621676"
+	searchBtn.ScaleType = Enum.ScaleType.Fit
+	searchBtn.BackgroundTransparency = 1
+	searchBtn.ZIndex = 100003
+	
+	local info = Instance.new("TextLabel", searchContent)
+	info.Name = "Info"
+	info.Size = UDim2.new(1, -16, 0, 24)
+	info.Position = UDim2.new(0, 8, 0, 30)
+	info.BackgroundTransparency = 1
+	info.TextColor3 = Color3.fromRGB(200, 200, 200)
+	info.TextSize = 12
+	info.Text = "Enter search term"
+	info.TextXAlignment = Enum.TextXAlignment.Left
+	info.ZIndex = 100002
+	
+	-- Loading circle setup
+	local loadingCircleAsset = nil
+	if getAsset and safeIsFile(assetFiles[4]) then
+		local ok, asset = pcall(function() return getAsset(assetFiles[4]) end)
+		if ok and asset then
+			loadingCircleAsset = asset
+			log("Loading circle loaded from file: " .. assetFiles[4])
+		end
+	end
+	
+	if not loadingCircleAsset then
+		loadingCircleAsset = assetUrls[4]
+		log("Using direct URL for loading circle")
+	end
+	
+	local loadingCircle = Instance.new("ImageLabel", searchContent)
+	loadingCircle.Name = "LoadingCircle"
+	loadingCircle.Size = UDim2.new(0, 24, 0, 24)
+	loadingCircle.Position = UDim2.new(0, 8, 0, 30)
+	loadingCircle.BackgroundTransparency = 1
+	loadingCircle.Image = loadingCircleAsset
+	loadingCircle.ImageColor3 = Color3.fromRGB(200, 200, 200)
+	loadingCircle.ZIndex = 100003
+	loadingCircle.Visible = false
+	
+	-- Rotation animation for loading circle
+	local rotationTween = nil
+	local function startLoadingAnimation()
+		loadingCircle.Visible = true
+		info.Visible = false
+		loadingCircle.Rotation = 0
+		
+		-- Create infinite rotation tween
+		local tweenInfo = TweenInfo.new(
+			1.2,  -- Duration (1.2 seconds per rotation)
+			Enum.EasingStyle.Linear,
+			Enum.EasingDirection.InOut,
+			-1,  -- Repeat count (-1 = infinite)
+			false,
+			0
+		)
+		
+		rotationTween = TweenService:Create(loadingCircle, tweenInfo, {Rotation = 360})
+		rotationTween:Play()
+	end
+	
+	local function stopLoadingAnimation()
+		if rotationTween then
+			rotationTween:Cancel()
+			rotationTween = nil
+		end
+		loadingCircle.Visible = false
+		info.Visible = true
+	end
+	
+	local searchScroll = Instance.new("ScrollingFrame", searchContent)
+	searchScroll.Name = "Scroll"
+	searchScroll.Position = UDim2.new(0, 8, 0, 58)
+	searchScroll.Size = UDim2.new(1, -16, 1, -66)
+	searchScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+	searchScroll.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
+	searchScroll.BorderSizePixel = 0
+	searchScroll.ScrollBarThickness = 5
+	searchScroll.ZIndex = 100001
+	
+	local searchLayout = Instance.new("UIListLayout", searchScroll)
+	searchLayout.Padding = UDim.new(0, 6)
+	searchLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	
+	-- Favorites content (NO BLACK BACKGROUND)
+	local favoritesContent = Instance.new("Frame", frame)
+	favoritesContent.Name = "FavoritesContent"
+	favoritesContent.Size = UDim2.new(1, 0, 1, -62)  -- Adjusted for smaller tabs
+	favoritesContent.Position = UDim2.new(0, 0, 0, 62)  -- Adjusted for smaller tabs
+	favoritesContent.BackgroundTransparency = 1  -- FULLY TRANSPARENT
+	favoritesContent.ZIndex = 100001
+	favoritesContent.Visible = false
+	
+	local favoritesScroll = Instance.new("ScrollingFrame", favoritesContent)
+	favoritesScroll.Name = "FavoritesScroll"
+	favoritesScroll.Position = UDim2.new(0, 8, 0, 8)
+	favoritesScroll.Size = UDim2.new(1, -16, 1, -16)
+	favoritesScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+	favoritesScroll.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
+	favoritesScroll.BorderSizePixel = 0
+	favoritesScroll.ScrollBarThickness = 5
+	favoritesScroll.ZIndex = 100001
+	
+	local favoritesLayout = Instance.new("UIListLayout", favoritesScroll)
+	favoritesLayout.Padding = UDim.new(0, 6)
+	favoritesLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	
+	-- Reset content (NO BLACK BACKGROUND)
+	local resetContent = Instance.new("Frame", frame)
+	resetContent.Name = "ResetContent"
+	resetContent.Size = UDim2.new(1, 0, 1, -62)  -- Adjusted for smaller tabs
+	resetContent.Position = UDim2.new(0, 0, 0, 62)  -- Adjusted for smaller tabs
+	resetContent.BackgroundTransparency = 1  -- FULLY TRANSPARENT
+	resetContent.ZIndex = 100001
+	resetContent.Visible = false
+	
+	local resetTitle = Instance.new("TextLabel", resetContent)
+	resetTitle.Size = UDim2.new(1, -16, 0, 30)
+	resetTitle.Position = UDim2.new(0, 8, 0, 20)
+	resetTitle.BackgroundTransparency = 1
+	resetTitle.Text = "Reset Current Song"
+	resetTitle.TextColor3 = Color3.new(1, 1, 1)
+	resetTitle.TextSize = 18
+	resetTitle.Font = Enum.Font.SourceSansBold
+	resetTitle.ZIndex = 100002
+	
+	local resetDesc = Instance.new("TextLabel", resetContent)
+	resetDesc.Size = UDim2.new(1, -32, 0, 60)
+	resetDesc.Position = UDim2.new(0, 16, 0, 55)
+	resetDesc.BackgroundTransparency = 1
+	resetDesc.Text = "This will reset the current level's song back to the original."
+	resetDesc.TextColor3 = Color3.fromRGB(200, 200, 200)
+	resetDesc.TextSize = 13
+	resetDesc.TextWrapped = true
+	resetDesc.TextXAlignment = Enum.TextXAlignment.Left
+	resetDesc.TextYAlignment = Enum.TextYAlignment.Top
+	resetDesc.ZIndex = 100002
+	
+	local resetBtn = Instance.new("ImageButton", resetContent)
+	resetBtn.Name = "ResetBtn"
+	resetBtn.Size = UDim2.new(0, 140, 0, 32)  -- Slightly smaller
+	resetBtn.Position = UDim2.new(0.5, -70, 0, 130)
+	resetBtn.Image = "rbxassetid://18807846310"
+	resetBtn.ScaleType = Enum.ScaleType.Slice
+	resetBtn.SliceCenter = Rect.new(100, 100, 100, 100)
+	resetBtn.BackgroundTransparency = 1
+	resetBtn.ZIndex = 100003
+	
+	local resetBtnText = Instance.new("TextLabel", resetBtn)
+	resetBtnText.Size = UDim2.new(1, 0, 1, 0)
+	resetBtnText.BackgroundTransparency = 1
+	resetBtnText.Text = "Reset Song"
+	resetBtnText.TextColor3 = Color3.new(1, 1, 1)
+	resetBtnText.TextSize = 14
+	resetBtnText.Font = Enum.Font.SourceSansBold
+	resetBtnText.ZIndex = 100004
+	
+	local resetStatus = Instance.new("TextLabel", resetContent)
+	resetStatus.Size = UDim2.new(1, -32, 0, 30)
+	resetStatus.Position = UDim2.new(0, 16, 0, 175)
+	resetStatus.BackgroundTransparency = 1
+	resetStatus.Text = ""
+	resetStatus.TextColor3 = Color3.fromRGB(100, 255, 100)
+	resetStatus.TextSize = 13
+	resetStatus.ZIndex = 100002
+	
+	-- Reset button functionality
+	resetBtn.MouseButton1Down:Connect(function()
+		PlayAchievementSound()
+
+		game.StarterGui:SetCore("SendNotification", {
+			Title = "NOTIFICATION";
+			Text = "Rejoin for these changes to apply.";
+			Duration = 5;
+		})
+
+		local fullId, numericId = getOriginalSongId()
+		if not numericId then
+			resetStatus.Text = "Error: Could not get current song ID"
+			resetStatus.TextColor3 = Color3.fromRGB(255, 100, 100)
+			return
+		end
+		
+		-- Clear the SoundLink
+		if fullId then
+			clearSoundLink(fullId)
+		end
+		
+		-- Stop mirror sound
+		if activeMirrorSound and activeMirrorSound.Parent then
+			activeMirrorSound:Stop()
+			activeMirrorSound:Destroy()
+			activeMirrorSound = nil
+		end
+		
+		-- Remove from preferences
+		if songPreferences[numericId] then
+			songPreferences[numericId] = nil
+			savePreferences()
+		end
+		
+		-- Mark as reset
+		resetStates[numericId] = true
+		saveResetStates()
+		
+		-- Restore original ID display
+		restoreOriginalIdDisplay(numericId)
+		
+		resetStatus.Text = "Original audio restored."
+		resetStatus.TextColor3 = Color3.fromRGB(100, 255, 100)
+		
+		log("Reset song for ID: " .. numericId)
+		
+		-- Clear status after 3 seconds
+		task.delay(3, function()
+			resetStatus.Text = ""
+		end)
+	end)
+	
+	-- Tab switching function
+	local function switchTab(tabName)
+		currentTab = tabName
+		
+		-- Update tab button appearances
+		for name, data in pairs(tabButtons) do
+			if name == tabName then
+				data.button.ImageColor3 = Color3.fromRGB(255, 255, 255)
+				data.text.TextColor3 = Color3.new(1, 1, 1)
+			else
+				data.button.ImageColor3 = Color3.fromRGB(150, 150, 150)
+				data.text.TextColor3 = Color3.fromRGB(180, 180, 180)
+			end
+		end
+		
+		-- Show/hide content
+		searchContent.Visible = (tabName == "Search")
+		favoritesContent.Visible = (tabName == "Favorites")
+		resetContent.Visible = (tabName == "Reset")
+		
+		-- Load favorites if switching to that tab
+		if tabName == "Favorites" then
+			loadFavoritesTab()
+		end
+		
+		log("Switched to tab: " .. tabName)
+	end
+	
+	-- Connect tab buttons
+	for name, data in pairs(tabButtons) do
+		data.button.MouseButton1Down:Connect(function()
+			switchTab(name)
+		end)
+	end
+	
+	-- Set initial tab
+	switchTab("Search")
+	
+	-- Close button stops sound and closes UI
+	close.MouseButton1Down:Connect(function() 
+		-- Stop any mirror sounds
+		if activeMirrorSound and activeMirrorSound.Parent then
+			activeMirrorSound:Stop()
+			activeMirrorSound:Destroy()
+			activeMirrorSound = nil
+		end
+		
+		gui.Enabled = false 
+	end)
+	
+	-- Drag
+	local drag = {dragging = false, startPos = nil, mouseStart = nil}
+	frame.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 then
+			drag.dragging = true
+			drag.startPos = frame.Position
+			drag.mouseStart = input.Position
+			local conn
+			conn = input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then 
+					drag.dragging = false 
+					conn:Disconnect() 
+				end
+			end)
+		end
+	end)
+	
+	UIS.InputChanged:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.MouseMovement and drag.dragging and i.Position then
+			local delta = i.Position - drag.mouseStart
+			frame.Position = UDim2.new(
+				drag.startPos.X.Scale, 
+				drag.startPos.X.Offset + delta.X,
+				drag.startPos.Y.Scale, 
+				drag.startPos.Y.Offset + delta.Y
+			)
+		end
+	end)
+	
+	return gui, frame, searchScroll, searchBox, searchBtn, info, searchLayout, loadingCircle, startLoadingAnimation, stopLoadingAnimation, favoritesScroll, favoritesLayout
+end
+
+local gui, frame, sc, searchBox, searchBtn, info, layout, loadingCircle, startLoadingAnimation, stopLoadingAnimation, favoritesScroll, favoritesLayout = makeGui()
+
+local function clearScroll()
+	for _, v in pairs(sc:GetChildren()) do 
+		if v:IsA("Frame") or v:IsA("ImageLabel") then v:Destroy() end 
+	end
+end
+
+local function clearFavorites()
+	for _, v in pairs(favoritesScroll:GetChildren()) do 
+		if v:IsA("Frame") or v:IsA("ImageLabel") then v:Destroy() end 
+	end
+end
+
+local function getLevelText()
+	local parent = s and s.Parent
+	local mid = parent and parent:FindFirstChild("MiddleItems")
+	if mid then
+		local ln = mid:FindFirstChild("LevelName")
+		if ln and ln:IsA("TextLabel") then return ln.Text end
+		local snn = mid:FindFirstChild("SongName")
+		if snn and snn:IsA("TextLabel") then return snn.Text end
+	end
+	return ""
+end
+
+-- Create unique key for favorites
+local function createFavoriteKey(it)
+	return it.id .. "_" .. it.title .. "_" .. it.artist
+end
+
+-- Check if song is favorited
+local function isFavorited(it)
+	local key = createFavoriteKey(it)
+	return favoriteSongs[key] ~= nil
+end
+
+-- Toggle favorite
+local function toggleFavorite(it, favoriteBtn)
+	local key = createFavoriteKey(it)
+	
+	if isFavorited(it) then
+		-- Remove from favorites
+		favoriteSongs[key] = nil
+		favoriteBtn.Image = "rbxassetid://18477104435"
+		log("Removed from favorites: " .. it.title)
+	else
+		-- Add to favorites
+		favoriteSongs[key] = {
+			title = it.title,
+			artist = it.artist,
+			id = it.id,
+			raw = it.raw
+		}
+		favoriteBtn.Image = "rbxassetid://18477090107"
+		log("Added to favorites: " .. it.title)
+	end
+	
+	saveFavorites()
+end
+
+local searchDeb = false
+local function performSearch()
+	if searchDeb then return end
+	searchDeb = true
+	
+	local q = tostring(searchBox.Text or ""):gsub("^%s*(.-)%s*$", "%1")
+	if q == "" then q = getLevelText() end
+	if q == "" then 
+		searchDeb = false
+		info.Text = "No query"
+		return 
+	end
+	
+	clearScroll()
+	startLoadingAnimation()  -- Show loading circle
+	
+	local ok, results, meta = pcall(function() return searchSFH(q) end)
+	
+	stopLoadingAnimation()  -- Hide loading circle
+	
+	if not ok then
+		info.Text = "Error: " .. tostring(results)
+		searchDeb = false
+		return
+	end
+	
+	if not results or #results == 0 then
+		info.Text = "No results"
+	else
+		info.Text = ""
+		showResults(results, 1)
+	end
+	
+	searchDeb = false
+end
+
+searchBtn.MouseButton1Down:Connect(performSearch)
+searchBox.FocusLost:Connect(function(enter) if enter then performSearch() end end)
+
+-- Results display
+local pageSize = 18
+
+local function addResultEntry(it, parentScroll, parentLayout)
+	local entryFrame = Instance.new("ImageLabel", parentScroll)
+	entryFrame.Size = UDim2.new(1, -10, 0, 56)
+	entryFrame.Image = "rbxassetid://18807846310"
+	entryFrame.ScaleType = Enum.ScaleType.Slice
+	entryFrame.SliceCenter = Rect.new(100, 100, 100, 100)
+	entryFrame.BackgroundTransparency = 1
+	entryFrame.ZIndex = 100010
+	
+	local name = Instance.new("TextLabel", entryFrame)
+	name.Size = UDim2.new(1, -90, 0, 24)
+	name.Position = UDim2.new(0, 8, 0, 6)
+	name.Text = it.title
+	name.TextColor3 = Color3.new(1, 1, 1)
+	name.TextSize = 13
+	name.Font = Enum.Font.SourceSansBold
+	name.BackgroundTransparency = 1
+	name.TextXAlignment = Enum.TextXAlignment.Left
+	name.TextTruncate = Enum.TextTruncate.AtEnd
+	name.ZIndex = 100011
+	
+	local sub = Instance.new("TextLabel", entryFrame)
+	sub.Size = UDim2.new(1, -90, 0, 18)
+	sub.Position = UDim2.new(0, 8, 0, 32)
+	sub.Text = it.artist .. " • " .. tostring(it.id)
+	sub.TextColor3 = Color3.fromRGB(180, 180, 180)
+	sub.TextSize = 11
+	sub.BackgroundTransparency = 1
+	sub.TextXAlignment = Enum.TextXAlignment.Left
+	sub.TextTruncate = Enum.TextTruncate.AtEnd
+	sub.ZIndex = 100011
+	
+	-- Favorite button
+	local favoriteBtn = Instance.new("ImageButton", entryFrame)
+	favoriteBtn.Name = "FavoriteBtn"
+	favoriteBtn.Size = UDim2.new(0.45, 0, 0.45, 0)
+	favoriteBtn.Position = UDim2.new(0.62, 0, 0.25, 0)
+	favoriteBtn.AnchorPoint = Vector2.new(0.5, 0.5)
+	favoriteBtn.Image = isFavorited(it) and "rbxassetid://18477090107" or "rbxassetid://18477104435"
+	favoriteBtn.BackgroundTransparency = 1
+	favoriteBtn.ZIndex = 100012
+	favoriteBtn.ScaleType = Enum.ScaleType.Fit
+	
+	favoriteBtn.MouseButton1Down:Connect(function()
+		toggleFavorite(it, favoriteBtn)
+	end)
+	
+	-- Play button
+	local btn = Instance.new("ImageButton", entryFrame)
+	btn.Size = UDim2.new(0.45, 0, 0.45, 0)
+	btn.Position = UDim2.new(0.85, 0, 0.25, 0)
+	btn.AnchorPoint = Vector2.new(0.5, 0.5)
+	btn.Image = "rbxassetid://18177735935"
+	btn.BackgroundTransparency = 1
+	btn.ZIndex = 100012
+	btn.ScaleType = Enum.ScaleType.Fit
+	
+	local isPlaying = false
+	local deb = false
+	btn.MouseButton1Down:Connect(function()
+		if deb then return end
+		deb = true
+		
+		if isPlaying then
+			-- Stop the song
+			if activeMirrorSound and activeMirrorSound.Parent then
+				activeMirrorSound:Stop()
+				activeMirrorSound:Destroy()
+				activeMirrorSound = nil
+			end
+			btn.Image = "rbxassetid://18177735935"
+			playingButtons[btn] = nil
+			isPlaying = false
+		else
+			-- Play the song
+			task.spawn(function()
+				playFromUrl(it, btn)
+				isPlaying = true
+			end)
+		end
+		
+		task.wait(0.3)
+		deb = false
+	end)
+	
+	parentScroll.CanvasSize = UDim2.new(0, 0, 0, parentLayout.AbsoluteContentSize.Y + 6)
+end
+
+function showResults(res, start)
+	start = start or 1
+	local last = math.min(#res, (start-1)+pageSize)
+	for i = start, last do addResultEntry(res[i], sc, layout) end
+	if last < #res then
+		local moreFrame = Instance.new("ImageLabel", sc)
+		moreFrame.Size = UDim2.new(1, -10, 0, 32)
+		moreFrame.Image = "rbxassetid://18807846310"
+		moreFrame.ScaleType = Enum.ScaleType.Slice
+		moreFrame.SliceCenter = Rect.new(100, 100, 100, 100)
+		moreFrame.BackgroundTransparency = 1
+		local more = Instance.new("TextButton", moreFrame)
+		more.Size = UDim2.new(1, 0, 1, 0)
+		more.Text = "More (" .. (#res-last) .. ")"
+		more.BackgroundTransparency = 1
+		more.TextColor3 = Color3.new(1, 1, 1)
+		more.TextSize = 12
+		more.ZIndex = 100011
+		more.MouseButton1Down:Connect(function()
+			moreFrame:Destroy()
+			showResults(res, last+1)
+		end)
+	end
+	sc.CanvasSize = UDim2.new(0, 0, 0, layout.AbsoluteContentSize.Y + 6)
+end
+
+-- Load favorites tab
+function loadFavoritesTab()
+	clearFavorites()
+	
+	local count = 0
+	for key, songData in pairs(favoriteSongs) do
+		count = count + 1
+		addResultEntry(songData, favoritesScroll, favoritesLayout)
+	end
+	
+	if count == 0 then
+		local emptyLabel = Instance.new("TextLabel", favoritesScroll)
+		emptyLabel.Size = UDim2.new(1, -16, 0, 40)
+		emptyLabel.Position = UDim2.new(0, 8, 0, 20)
+		emptyLabel.BackgroundTransparency = 1
+		emptyLabel.Text = "No favorite songs yet!\nClick the heart icon to add songs to favorites."
+		emptyLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
+		emptyLabel.TextSize = 13
+		emptyLabel.TextWrapped = true
+		emptyLabel.ZIndex = 100011
+	end
+	
+	favoritesScroll.CanvasSize = UDim2.new(0, 0, 0, favoritesLayout.AbsoluteContentSize.Y + 6)
+	log("Loaded " .. count .. " favorites")
+end
+
+local function openPanel(q)
+	if not gui or not gui.Parent then return end
+	gui.Enabled = true
+	searchBox.Text = tostring(q or "")
+	clearScroll()
+	info.Text = ""
+	
+	-- Bounce animation
+	local targetSize = UDim2.new(0, 420, 0, 320)  -- Slightly bigger for tabs
+	local tweenInfo = TweenInfo.new(
+		0.5,  -- Duration
+		Enum.EasingStyle.Back,  -- Easing style (Back creates bounce)
+		Enum.EasingDirection.Out  -- Direction
+	)
+	
+	local tween = TweenService:Create(frame, tweenInfo, {Size = targetSize})
+	tween:Play()
+end
+
+for i = 1, #pinButtons do
+	pinButtons[i].MouseButton1Down:Connect(function()
+		openPanel(getLevelText())
+	end)
+end
+
+UIS.InputBegan:Connect(function(i, gp)
+	if gp then return end
+	if i.KeyCode == Enum.KeyCode.Escape and gui and gui.Enabled then 
+		-- Stop sound when closing with ESC
+		if activeMirrorSound and activeMirrorSound.Parent then
+			activeMirrorSound:Stop()
+			activeMirrorSound:Destroy()
+			activeMirrorSound = nil
+		end
+		gui.Enabled = false 
+	end
+end)
+
+-- AUTO-LOAD PREFERENCES ON STARTUP
+-- Immediately set up SoundLinks for ALL saved preferences without waiting for UI
+task.spawn(function()
+	log("=== AUTO-LOAD: Starting immediate preference application ===")
+	task.wait(0.5)  -- Brief wait for basic initialization
+	
+	local count = 0
+	for levelId, pref in pairs(songPreferences) do
+		if pref and pref.url and resetStates[levelId] ~= true then
+			local rbxAssetId = "rbxassetid://" .. levelId
+			log("=== AUTO-LOAD: Setting up SoundLink for level " .. levelId .. " ===")
+			log("    Song: " .. pref.title .. " by " .. pref.artist)
+			
+			-- Set up SoundLink immediately
+			SoundLink(rbxAssetId, pref.url)
+			count = count + 1
+			
+			task.wait(0.1)  -- Small delay between setups to prevent overwhelming
+		end
+	end
+	
+	if count > 0 then
+		log("=== AUTO-LOAD: Successfully set up " .. count .. " SoundLinks! ===")
+	else
+		log("=== AUTO-LOAD: No saved preferences to load ===")
+	end
+end)
+
+-- Monitor for UI updates to show correct song info in the display
+task.spawn(function()
+	while true do
+		task.wait(1)
+		if not lp or not lp.Parent then break end
+		
+		local fullId, numericId = getOriginalSongId()
+		if numericId then
+			local pref = songPreferences[numericId]
+			if pref and resetStates[numericId] ~= true then
+				-- Update the display if we have a preference
+				local songInfo = lp.PlayerGui:FindFirstChild("MainUI")
+					and lp.PlayerGui.MainUI:FindFirstChild("States")
+					and lp.PlayerGui.MainUI.States:FindFirstChild("OnlineLevelViewMenu")
+					and lp.PlayerGui.MainUI.States.OnlineLevelViewMenu:FindFirstChild("MiddleItems")
+					and lp.PlayerGui.MainUI.States.OnlineLevelViewMenu.MiddleItems:FindFirstChild("SongInfo")
+				
+				if songInfo then
+					local songNameLabel = songInfo:FindFirstChild("SongName")
+					local usernameLabel = songInfo:FindFirstChild("Username")
+					
+					if songNameLabel and usernameLabel then
+						if songNameLabel.Text ~= pref.title or usernameLabel.Text ~= pref.artist then
+							updateSongDisplay(pref.title, pref.artist)
+							
+							if pref.filename then
+								updateIdDisplay(numericId, pref.filename)
+							end
+							
+							log("Updated display for level " .. numericId)
+						end
+					end
+				end
+			end
+		end
+	end
+end)
+
+-- Monitor for level changes and auto-restore songs
+task.spawn(function()
+	while true do
+		task.wait(2)
+		if not lp or not lp.Parent then break end
+		if gui and gui.Parent ~= lp.PlayerGui and lp:FindFirstChild("PlayerGui") then 
+			gui.Parent = lp.PlayerGui 
+		end
+		
+		-- Check for level changes
+		checkAndRestoreSong()
+	end
+end)
+
+-- Additional verification loop to ensure song stays loaded
+task.spawn(function()
+	while true do
+		task.wait(1)
+		if not lp or not lp.Parent then break end
+		
+		local fullId, numericId = getOriginalSongId()
+		if numericId and songPreferences[numericId] and resetStates[numericId] ~= true then
+			local pref = songPreferences[numericId]
+			
+			-- Check if the displayed song info matches our saved preference
+			local songInfo = lp.PlayerGui:FindFirstChild("MainUI")
+				and lp.PlayerGui.MainUI:FindFirstChild("States")
+				and lp.PlayerGui.MainUI.States:FindFirstChild("OnlineLevelViewMenu")
+				and lp.PlayerGui.MainUI.States.OnlineLevelViewMenu:FindFirstChild("MiddleItems")
+				and lp.PlayerGui.MainUI.States.OnlineLevelViewMenu.MiddleItems:FindFirstChild("SongInfo")
+			
+			if songInfo then
+				local songNameLabel = songInfo:FindFirstChild("SongName")
+				local usernameLabel = songInfo:FindFirstChild("Username")
+				
+				if songNameLabel and usernameLabel then
+					local currentSongName = songNameLabel.Text
+					local currentUsername = usernameLabel.Text
+					
+					-- If the names don't match our saved preference, reload it
+					if currentSongName ~= pref.title or currentUsername ~= pref.artist then
+						log("Song info mismatch detected! Reloading saved preference...")
+						log("Expected: " .. pref.title .. " by " .. pref.artist)
+						log("Found: " .. currentSongName .. " by " .. currentUsername)
+						
+						-- Update display only
+						updateSongDisplay(pref.title, pref.artist)
+						
+						if pref.filename then
+							updateIdDisplay(numericId, pref.filename)
+						end
+						
+						-- Let SoundLink handle the audio replacement
+						if fullId and pref.url then
+							SoundLink(fullId, pref.url)
+							log("SoundLink reactivated: " .. fullId .. " -> " .. pref.url)
+						end
+					end
+				end
+			end
+		end
+	end
+end)
+
+-- ============================================================================
+-- CUSTOM FONT APPLICATION - INITIALIZE AND MONITOR
+-- ============================================================================
+
+-- Initialize the font system
+task.spawn(function()
+	task.wait(1)  -- Wait for basic initialization
+	
+	if initializeFontSystem() then
+		-- Wait for GUI to be created
+		local attempts = 0
+		while attempts < 20 and not lp.PlayerGui:FindFirstChild("SFHGui") do
+			task.wait(0.5)
+			attempts = attempts + 1
+		end
+		
+		local sfhGui = lp.PlayerGui:FindFirstChild("SFHGui")
+		if sfhGui then
+			log("[Font] Applying custom font to Jukebox GUI...")
+			task.wait(0.3)
+			applyFontToContainer(sfhGui)
+		end
+		
+		-- Monitor for GUI recreation
+		lp.PlayerGui.ChildAdded:Connect(function(child)
+			if child.Name == "SFHGui" then
+				log("[Font] Jukebox GUI recreated, applying fonts...")
+				task.wait(0.3)
+				table.clear(processedElements)
+				applyFontToContainer(child)
+			end
+		end)
+		
+		-- Continuous monitoring for missed elements
+		task.spawn(function()
+			while task.wait(2) do
+				local sfhGui = lp.PlayerGui:FindFirstChild("SFHGui")
+				if sfhGui and fontRenderer then
+					for _, element in ipairs(sfhGui:GetDescendants()) do
+						if (element:IsA("TextLabel") or element:IsA("TextBox")) 
+							and not processedElements[element] 
+							and not element:GetAttribute("NoCustomFont") then
+							applyCustomFont(element)
+						end
+					end
+				end
+			end
+		end)
+	end
+end)
+
+-- ============================================================================
+-- FINAL SETUP
+-- ============================================================================
+
+log("=== JUKEBOX READY ===")
+log("Click the pin disc to open the song search panel")
+log("Songs will be automatically restored when you return to levels")
+log("AUTO-LOAD: Saved preferences will be loaded automatically in 0.5 seconds!")
+log("Continuous verification active - songs will stay loaded!")
+log("Favorites feature enabled!")
+log("Reset feature enabled!")
+if ENABLE_CUSTOM_FONT then
+	log("Custom font system enabled!")
+else
+	log("Custom font system disabled")
+end
+
+loadPreferences()
+
+task.wait(1)
+ccc = game:GetService("Players").LocalPlayer.PlayerGui.SFHGui.Frame.SearchContent.Scroll
+ccc.BackgroundTransparency = 1
+bbb = game:GetService("Players").LocalPlayer.PlayerGui.SFHGui.Frame.FavoritesContent.FavoritesScroll
+bbb.BackgroundTransparency = 1
+eee = game:GetService("Players").LocalPlayer.PlayerGui.SFHGui.Frame.SearchContent
+eee.Position = UDim2.new(0, 0, 0, 62)
