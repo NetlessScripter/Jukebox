@@ -1,7 +1,3 @@
--- ============================================================================
--- BITMAP FONT RENDERER (INTEGRATED)
--- ============================================================================
-
 local RunService = game:GetService("RunService")
 
 local BitmapFontRenderer = {}
